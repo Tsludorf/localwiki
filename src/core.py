@@ -29,6 +29,7 @@ EXTENSION_MIME_MAP = {
     ".html": "text/html",
     ".htm": "text/html",
     ".csv": "text/csv",
+    ".pdf": "application/pdf",
     ".bz2": "application/x-bzip2",
     ".zim": "application/x-zim",
 }
@@ -41,6 +42,8 @@ def detect_source_type_and_mime(file_path: Path) -> Tuple[str, str]:
 
     if suffix == ".zim":
         return "zim", mime_type
+    if suffix == ".pdf":
+        return "pdf", mime_type
     if suffix in {".jsonl", ".ndjson", ".xml", ".bz2"}:
         return "wikidump", mime_type
     if mime_type.startswith("text/") or suffix in {".json"}:
@@ -629,6 +632,10 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
     )
     registry.add_ingestion_run(run)
     
+    had_item_errors = False
+    processed_items = 0
+    failed_items = 0
+
     try:
         # Discover source files and register them before processing
         if source.source_type == "folder":
@@ -651,7 +658,7 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                     status="pending"
                 )
                 registry.add_source_item(source_item)
-        elif source.source_type in {"zim", "wikidump", "file", "text"}:
+        elif source.source_type in {"zim", "wikidump", "file", "text", "pdf"}:
             source_file = Path(source.root_uri)
             if source_file.exists() and source_file.is_file():
                 stat = source_file.stat()
@@ -694,6 +701,7 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                     title = parsed_doc.get("title") or Path(item.uri).name
                     source_uri = parsed_doc.get("source_uri") or item.uri
                     source_type = parsed_doc.get("source_type") or metadata.get("source_type") or source.source_type or "text"
+                    display_uri = metadata.get("display_uri") or item.display_uri or Path(item.uri).name
                     doc_key = f"{source_uri}:{title}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
 
                     document = doc_manager.create_document(
@@ -727,6 +735,7 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                                     "title": title,
                                     "source_uri": source_uri,
                                     "source_type": source_type,
+                                    "display_uri": display_uri,
                                 },
                                 "chunk_text": chunk_data['chunk_text']
                             })
@@ -739,9 +748,13 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                                            document, registry, item, source, kb_name)
 
                 registry.update_source_item_status(item.source_item_id, "completed")
+                processed_items += 1
                 
             except Exception as e:
                 logger.error(f"Error processing item {item.uri}: {str(e)}")
+                had_item_errors = True
+                failed_items += 1
+                registry.update_source_item_status(item.source_item_id, "failed")
                 # Record parser error
                 error = ParserError(
                     error_id=f"err_{uuid.uuid4().hex}",
@@ -755,6 +768,12 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                 )
                 # Add error to registry (will need to add method for this)
                 
+        if had_item_errors:
+            registry.update_ingestion_run_status(run_id, "failed", str(int(time.time())))
+            raise RuntimeError(
+                f"Ingestion failed for source {source_id}: processed={processed_items}, failed={failed_items}"
+            )
+
         # Mark ingestion run as complete
         registry.update_ingestion_run_status(run_id, "completed", str(int(time.time())))
         logger.info(f"Ingestion pipeline complete for source: {source_id}")
@@ -774,16 +793,54 @@ def _collection_name_for(kb_name: str, model_name: str) -> str:
 
 
 def _embed_texts(texts: List[str], model_name: str, ollama_url: str) -> List[List[float]]:
-    payload = {"model": model_name, "input": texts}
+    if not texts:
+        return []
+
     url = ollama_url.rstrip("/") + "/api/embed"
-    with httpx.Client(timeout=120.0) as client:
-        response = client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-    embeddings = data.get("embeddings") or []
-    if len(embeddings) != len(texts):
+    batch_size = int(os.getenv("LOCALWIKI_EMBED_BATCH_SIZE", "24"))
+    timeout_seconds = float(os.getenv("LOCALWIKI_EMBED_TIMEOUT_SECONDS", "600"))
+    all_embeddings: List[List[float]] = []
+
+    with httpx.Client(timeout=timeout_seconds) as client:
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            payload = {"model": model_name, "input": batch}
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            embeddings = data.get("embeddings") or []
+            if len(embeddings) != len(batch):
+                raise RuntimeError(
+                    f"Embedding count mismatch from Ollama: expected {len(batch)} got {len(embeddings)}"
+                )
+            all_embeddings.extend(embeddings)
+
+    if len(all_embeddings) != len(texts):
         raise RuntimeError("Embedding count mismatch from Ollama")
-    return embeddings
+    return all_embeddings
+
+
+def _build_embedding_text(
+    chunk_text: str,
+    chunk_meta: Dict[str, Any],
+    document: CanonicalDocument,
+    source_item: SourceItem,
+    source: Source,
+) -> str:
+    title = (chunk_meta.get("title") or document.title or "").strip()
+    source_uri = (chunk_meta.get("source_uri") or source_item.uri or "").strip()
+    source_type = (chunk_meta.get("source_type") or source.source_type or "text").strip()
+    display_uri = (chunk_meta.get("display_uri") or source_item.display_uri or "").strip()
+
+    context_lines = [
+        f"Title: {title}" if title else "",
+        f"Source: {display_uri or source_uri}" if (display_uri or source_uri) else "",
+        f"Source Type: {source_type}" if source_type else "",
+    ]
+    context = "\n".join(line for line in context_lines if line)
+    if not context:
+        return chunk_text
+    return f"{context}\n\n{chunk_text}".strip()
 
 
 def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
@@ -829,7 +886,8 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
                 chunk_text = ""
         if not chunk_text:
             continue
-        texts.append(chunk_text)
+        embed_text = _build_embedding_text(chunk_text, chunk_meta, document, source_item, source)
+        texts.append(embed_text)
         chunk_text_by_id[chunk.chunk_id] = {"text": chunk_text, "meta": chunk_meta}
         point_batch.append(chunk)
 

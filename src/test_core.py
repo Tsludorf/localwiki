@@ -12,7 +12,7 @@ from pathlib import Path
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from core import IngestionRegistry, Source, SourceItem, BaseParser, detect_source_type_and_mime
+from core import IngestionRegistry, Source, SourceItem, BaseParser, CanonicalDocument, detect_source_type_and_mime, _build_embedding_text
 from parsers import ParserFactory
 import pytest
 
@@ -30,6 +30,10 @@ def test_detect_source_type_and_mime():
     assert text_type == "text"
     assert text_mime == "text/markdown"
 
+    pdf_type, pdf_mime = detect_source_type_and_mime(Path("/tmp/report.pdf"))
+    assert pdf_type == "pdf"
+    assert pdf_mime == "application/pdf"
+
 
 def test_parser_factory_ndjson_parser_selection():
     item = SourceItem(
@@ -45,6 +49,63 @@ def test_parser_factory_ndjson_parser_selection():
     )
     parser = ParserFactory.create_parser_for_item(item)
     assert getattr(parser, "parser_name", "") == "wikiextractor-jsonl"
+
+
+def test_parser_factory_pdf_parser_selection():
+    item = SourceItem(
+        source_item_id="item_pdf_parser_factory",
+        source_id="source_pdf_parser_factory",
+        uri="/tmp/report.pdf",
+        display_uri="report.pdf",
+        mime_type="application/pdf",
+        size_bytes=1,
+        mtime="0",
+        content_hash="",
+        status="pending",
+    )
+    parser = ParserFactory.create_parser_for_item(item)
+    assert getattr(parser, "parser_name", "") == "pdf"
+
+
+def test_build_embedding_text_includes_context():
+    chunk_text = "A short passage about a topic."
+    source_item = SourceItem(
+        source_item_id="item_ctx",
+        source_id="source_ctx",
+        uri="/tmp/folder/notes.txt",
+        display_uri="folder/notes.txt",
+        mime_type="text/plain",
+        size_bytes=10,
+        mtime="0",
+        content_hash="",
+        status="pending",
+    )
+    source = Source(
+        source_id="source_ctx",
+        source_type="text",
+        root_uri="/tmp/folder",
+        display_name="notes",
+        added_at="0",
+        settings_json="{}",
+    )
+    doc = CanonicalDocument(
+        doc_id="doc_ctx",
+        source_item_id="item_ctx",
+        title="folder/notes.txt",
+        parser="text",
+        parser_version="1.0.0",
+        version_hash="1.0.0",
+        text_hash="x",
+        metadata_json="{}",
+        created_at="0",
+        updated_at="0",
+    )
+
+    embedded = _build_embedding_text(chunk_text, {}, doc, source_item, source)
+    assert "Title: folder/notes.txt" in embedded
+    assert "Source: folder/notes.txt" in embedded
+    assert "Source Type: text" in embedded
+    assert embedded.endswith(chunk_text)
 
 def test_registry_initialization():
     """Test that the registry initializes correctly."""

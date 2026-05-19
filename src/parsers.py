@@ -49,12 +49,68 @@ class TextParser(BaseParser):
                 "file_size": len(content),
                 "encoding": "utf-8",
                 "source_uri": source_item.uri,
+                "display_uri": getattr(source_item, "display_uri", Path(source_item.uri).name),
+                "mime_type": getattr(source_item, "mime_type", "text/plain"),
             }
             logger.info(f"Parsed text file: {source_item.uri}")
             return content, metadata
         except Exception as e:
             logger.error(f"Failed to parse text file {source_item.uri}: {e}")
             raise
+
+    def parse_documents(self, source_item) -> List[Dict[str, Any]]:
+        text, metadata = self.parse(source_item)
+        title = metadata.get("display_uri") or Path(source_item.uri).name
+        return [{
+            "text": text,
+            "metadata": metadata,
+            "title": title,
+            "source_uri": source_item.uri,
+        }]
+
+
+class PdfParser(BaseParser):
+    def __init__(self):
+        super().__init__("pdf")
+
+    def parse(self, source_item) -> Tuple[str, Dict[str, Any]]:
+        try:
+            from pypdf import PdfReader
+        except Exception as exc:
+            raise RuntimeError(
+                "PDF parsing requires pypdf. Install with: pip install pypdf"
+            ) from exc
+
+        try:
+            reader = PdfReader(source_item.uri)
+            page_texts: List[str] = []
+            for page in reader.pages:
+                page_texts.append(page.extract_text() or "")
+            content = "\n\n".join(t.strip() for t in page_texts if t and t.strip())
+
+            metadata = {
+                "source_type": "pdf",
+                "file_size": Path(source_item.uri).stat().st_size,
+                "page_count": len(reader.pages),
+                "source_uri": source_item.uri,
+                "display_uri": getattr(source_item, "display_uri", Path(source_item.uri).name),
+                "mime_type": getattr(source_item, "mime_type", "application/pdf"),
+            }
+            logger.info("Parsed PDF file: %s (pages=%s)", source_item.uri, len(reader.pages))
+            return content, metadata
+        except Exception as e:
+            logger.error(f"Failed to parse PDF file {source_item.uri}: {e}")
+            raise
+
+    def parse_documents(self, source_item) -> List[Dict[str, Any]]:
+        text, metadata = self.parse(source_item)
+        title = metadata.get("display_uri") or Path(source_item.uri).name
+        return [{
+            "text": text,
+            "metadata": metadata,
+            "title": title,
+            "source_uri": source_item.uri,
+        }]
 
 
 class WikiExtractorJsonlParser(BaseParser):
@@ -399,6 +455,12 @@ class ZimParser(BaseParser):
 class ParserFactory:
     _parsers = {
         "text": TextParser,
+        "text/plain": TextParser,
+        "text/markdown": TextParser,
+        "text/html": TextParser,
+        "application/json": TextParser,
+        "pdf": PdfParser,
+        "application/pdf": PdfParser,
         "wikidump": WikiExtractorJsonlParser,
         "wikiextractor-jsonl": WikiExtractorJsonlParser,
         "application/x-ndjson": WikiExtractorJsonlParser,
@@ -433,6 +495,8 @@ class ParserFactory:
             return cls.create_parser('zim')
         if uri.endswith('.jsonl') or uri.endswith('.ndjson'):
             return cls.create_parser('wikiextractor-jsonl')
+        if uri.endswith('.pdf'):
+            return cls.create_parser('pdf')
         
         # Default to text parser
         return cls.create_parser('text')

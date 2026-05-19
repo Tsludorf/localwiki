@@ -16,6 +16,7 @@ setup(
         'pyyaml>=6.0.0',
         'python-dotenv>=1.0.0',
         'rich>=13.0.0',
+        'pypdf>=4.0.0',
         'tika>=1.24',
         'docling>=1.0.0',
     ],
