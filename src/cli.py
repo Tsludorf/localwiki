@@ -13,11 +13,26 @@ import json
 import time
 import uuid
 from typing import Dict, Any
-import os
 
-from src.core import IngestionRegistry, Source, SourceItem, DocumentManager, run_ingestion_pipeline, detect_source_type_and_mime
-from src.qdrant_utils import initialize_qdrant_client, list_collections, search_in_collection, create_collection
+from src.core import (
+    IngestionRegistry,
+    Source,
+    SourceItem,
+    DocumentManager,
+    run_ingestion_pipeline,
+    detect_source_type_and_mime,
+    resolve_collection_name,
+    infer_embedding_dimension,
+    collection_name_for_dimension,
+)
+from src.qdrant_utils import initialize_qdrant_client, list_collections, search_in_collection, create_collection, collection_exists
 import httpx
+
+BGE_M3_DEFAULT_EMBEDDER = "bge-m3:latest"
+BGE_M3_DEFAULT_CHUNK_TOKENS = 900
+BGE_M3_DEFAULT_CHUNK_OVERLAP = 200
+BGE_M3_DEFAULT_EMBED_BATCH_SIZE = 24
+BGE_M3_DEFAULT_QDRANT_BATCH_SIZE = 192
 
 
 def setup_cli():
@@ -58,7 +73,7 @@ Examples:
     add_zim_parser.add_argument('path', help='Path to the ZIM file')
     add_zim_parser.add_argument('--name', required=True, help='Display name for the source')
     add_zim_parser.add_argument('--kb', help='KB name for immediate ingestion (default: source name)')
-    add_zim_parser.add_argument('--embedder', default='ollama:embeddinggemma', help='Embedding model for immediate ingestion')
+    add_zim_parser.add_argument('--embedder', default=BGE_M3_DEFAULT_EMBEDDER, help='Embedding model for immediate ingestion')
     add_zim_parser.add_argument('--qdrant', default='http://127.0.0.1:6333', help='Qdrant endpoint for immediate ingestion')
     add_zim_parser.add_argument('--no-auto-ingest', action='store_true', help='Only add source, do not ingest immediately')
     
@@ -70,30 +85,44 @@ Examples:
     # Bulk update sources from Desktop/wiki_sources
     update_sources_parser = sources_subparsers.add_parser('update', help='Add new files from ~/Desktop/wiki_sources')
     update_sources_parser.add_argument('--path', default='~/Desktop/wiki_sources', help='Folder to scan for source files')
-    update_sources_parser.add_argument('--embedder', default='ollama:embeddinggemma', help='Embedding model for auto-ingest')
+    update_sources_parser.add_argument('--embedder', default=BGE_M3_DEFAULT_EMBEDDER, help='Embedding model for auto-ingest')
     update_sources_parser.add_argument('--qdrant', default='http://127.0.0.1:6333', help='Qdrant endpoint for auto-ingest')
+    update_sources_parser.add_argument('--collection', default=None, help='Qdrant collection override for auto-ingest')
+    update_sources_parser.add_argument('--limit', type=int, default=10000, help='Document ingest limit per source (0 = unlimited)')
+    update_sources_parser.add_argument('--recreate', action='store_true', help='Delete and recreate collection before auto-ingest')
+    update_sources_parser.add_argument('--embed-batch-size', type=int, default=BGE_M3_DEFAULT_EMBED_BATCH_SIZE, help='Embedding request batch size')
+    update_sources_parser.add_argument('--qdrant-batch-size', type=int, default=BGE_M3_DEFAULT_QDRANT_BATCH_SIZE, help='Qdrant upsert batch size')
+    update_sources_parser.add_argument('--chunk-tokens', type=int, default=BGE_M3_DEFAULT_CHUNK_TOKENS, help='Target tokens per chunk')
+    update_sources_parser.add_argument('--chunk-overlap', type=int, default=BGE_M3_DEFAULT_CHUNK_OVERLAP, help='Token overlap between chunks')
     update_sources_parser.add_argument('--no-auto-ingest', action='store_true', help='Only add sources, do not ingest immediately')
 
-    delete_all_sources_parser = sources_subparsers.add_parser('delete_all', help='Delete all sources and clear local_wiki collection')
+    delete_all_sources_parser = sources_subparsers.add_parser('delete_all', help='Delete all sources and clear inferred collection')
     delete_all_sources_parser.add_argument('--qdrant', default='http://127.0.0.1:6333', help='Qdrant endpoint')
-    delete_all_sources_parser.add_argument('--collection', default=None, help='Collection to clear (default: env/local_wiki)')
+    delete_all_sources_parser.add_argument('--collection', default=None, help='Collection to clear (default: inferred by embedder dimension)')
+    delete_all_sources_parser.add_argument('--embedder', default=BGE_M3_DEFAULT_EMBEDDER, help='Embedder used to infer default dimensioned collection')
     
     # Ingest command
     ingest_parser = subparsers.add_parser('ingest', help='Start ingestion process')
     ingest_parser.add_argument('--source', required=True, help='Source to ingest')
     ingest_parser.add_argument('--kb', required=True, help='Knowledge base to use')
-    ingest_parser.add_argument('--embedder', default='ollama:embeddinggemma', help='Embedding model to use')
+    ingest_parser.add_argument('--embedder', default=BGE_M3_DEFAULT_EMBEDDER, help='Embedding model to use')
     ingest_parser.add_argument('--qdrant', default='http://127.0.0.1:6333', help='Qdrant endpoint')
     ingest_parser.add_argument('--collection', help='Qdrant collection name')
     ingest_parser.add_argument('--alias', help='Qdrant collection alias')
     ingest_parser.add_argument('--changed-only', action='store_true', help='Only process changed documents')
+    ingest_parser.add_argument('--limit', type=int, default=10000, help='Document ingest limit (0 = unlimited)')
+    ingest_parser.add_argument('--recreate', action='store_true', help='Delete and recreate target Qdrant collection before ingesting')
+    ingest_parser.add_argument('--embed-batch-size', type=int, default=BGE_M3_DEFAULT_EMBED_BATCH_SIZE, help='Embedding request batch size')
+    ingest_parser.add_argument('--qdrant-batch-size', type=int, default=BGE_M3_DEFAULT_QDRANT_BATCH_SIZE, help='Qdrant upsert batch size')
+    ingest_parser.add_argument('--chunk-tokens', type=int, default=BGE_M3_DEFAULT_CHUNK_TOKENS, help='Target tokens per chunk')
+    ingest_parser.add_argument('--chunk-overlap', type=int, default=BGE_M3_DEFAULT_CHUNK_OVERLAP, help='Token overlap between chunks')
     
     # Search command
     search_parser = subparsers.add_parser('search', help='Search in the knowledge base')
     search_parser.add_argument('--query', required=True, help='Search query')
     search_parser.add_argument('--top', type=int, default=5, help='Number of results')
     search_parser.add_argument('--kb', default=None, help='Optional KB payload filter')
-    search_parser.add_argument('--embedder', default='embeddinggemma:latest', help='Embedding model for search')
+    search_parser.add_argument('--embedder', default=BGE_M3_DEFAULT_EMBEDDER, help='Embedding model for search')
     search_parser.add_argument('--qdrant', default='http://127.0.0.1:6333', help='Qdrant endpoint')
     search_parser.add_argument('--collection', help='Qdrant collection to search')
     
@@ -108,6 +137,10 @@ Examples:
     
     # List collections
     list_collections_parser = collections_subparsers.add_parser('list', help='List all collections')
+
+    # Delete collection
+    delete_collection_parser = collections_subparsers.add_parser('delete', help='Delete a collection')
+    delete_collection_parser.add_argument('collection', help='Collection name to delete')
     
     # Alias commands
     alias_parser = collections_subparsers.add_parser('alias-create', help='Create a collection alias')
@@ -184,7 +217,7 @@ def run_sources_add_folder(folder_path, name):
     print(f"Successfully added folder source: {source_id}")
 
 
-def run_sources_add_zim(zim_path, name, kb_name=None, embedder='ollama:embeddinggemma',
+def run_sources_add_zim(zim_path, name, kb_name=None, embedder=BGE_M3_DEFAULT_EMBEDDER,
                         qdrant_url='http://127.0.0.1:6333', auto_ingest=True):
     """Add a ZIM archive as a source."""
     print(f"Adding ZIM source: {zim_path}")
@@ -217,14 +250,25 @@ def run_sources_add_zim(zim_path, name, kb_name=None, embedder='ollama:embedding
     effective_kb = kb_name or name
     print(f"Auto-ingesting source: {source_id} into kb: {effective_kb}")
     qdrant_client = initialize_qdrant_client(qdrant_url)
-    run_ingestion_pipeline(
+    stats = run_ingestion_pipeline(
         source_id=source_id,
         registry=registry,
         qdrant_client=qdrant_client,
         embedder=embedder,
         kb_name=effective_kb,
     )
-    print("Auto-ingestion complete!")
+    print(f"- status: {stats.get('status', 'unknown')}")
+    print(f"- documents discovered: {stats.get('documents_discovered', 0)}")
+    print(f"- documents parsed: {stats.get('documents_parsed', 0)}")
+    print(f"- chunks created: {stats.get('chunks_created', 0)}")
+    print(f"- chunks embedded: {stats.get('chunks_embedded', 0)}")
+    print(f"- points stored: {stats.get('points_stored', 0)}")
+    if stats.get("status") != "completed":
+        sys.exit(1)
+    if stats.get("status") == "completed":
+        print("Auto-ingestion complete!")
+    else:
+        print("Auto-ingestion failed")
 
 
 def run_sources_add_wikidump(dump_path, name):
@@ -254,8 +298,14 @@ def run_sources_add_wikidump(dump_path, name):
     print(f"Successfully added Wikipedia dump source: {source_id}")
 
 
-def run_sources_update(folder_path: str, embedder: str = 'ollama:embeddinggemma',
-                       qdrant_url: str = 'http://127.0.0.1:6333', auto_ingest: bool = True):
+def run_sources_update(folder_path: str, embedder: str = BGE_M3_DEFAULT_EMBEDDER,
+                       qdrant_url: str = 'http://127.0.0.1:6333', auto_ingest: bool = True,
+                       collection_name: str = None, limit: int = 10000,
+                       recreate: bool = False,
+                       embed_batch_size: int = BGE_M3_DEFAULT_EMBED_BATCH_SIZE,
+                       qdrant_batch_size: int = BGE_M3_DEFAULT_QDRANT_BATCH_SIZE,
+                       chunk_tokens: int = BGE_M3_DEFAULT_CHUNK_TOKENS,
+                       chunk_overlap: int = BGE_M3_DEFAULT_CHUNK_OVERLAP):
     """Add all new source files from a folder.
 
     Rules:
@@ -272,6 +322,14 @@ def run_sources_update(folder_path: str, embedder: str = 'ollama:embeddinggemma'
     registry = IngestionRegistry()
     existing_root_uris = {s.root_uri for s in registry.list_sources()}
     qdrant_client = initialize_qdrant_client(qdrant_url) if auto_ingest else None
+    collection = resolve_collection_name(embedder=embedder, collection_name=collection_name)
+    collection_label = collection or "auto(local_wiki_<dim>)"
+
+    if auto_ingest and recreate:
+        if collection and collection_exists(qdrant_client, collection):
+            qdrant_client.delete_collection(collection)
+            print(f"Deleted existing collection: {collection}")
+        print(f"Collection will be created on first embedding batch: {collection_label}")
 
     added = 0
     ingested = 0
@@ -310,15 +368,41 @@ def run_sources_update(folder_path: str, embedder: str = 'ollama:embeddinggemma'
         if auto_ingest:
             kb_name = child.stem
             print(f"Auto-ingesting source: {source_id} into kb: {kb_name}")
+            print(
+                "[Auto-Ingest Config] "
+                f"embedder={embedder} "
+                f"limit={limit} "
+                f"embed_batch_size={embed_batch_size} "
+                f"qdrant_batch_size={qdrant_batch_size} "
+                f"chunk_tokens={chunk_tokens} "
+                f"chunk_overlap={chunk_overlap} "
+                f"collection={collection_label}"
+            )
             try:
-                run_ingestion_pipeline(
+                stats = run_ingestion_pipeline(
                     source_id=source_id,
                     registry=registry,
                     qdrant_client=qdrant_client,
                     embedder=embedder,
                     kb_name=kb_name,
+                    limit=limit,
+                    collection_name=collection,
+                    embed_batch_size=embed_batch_size,
+                    qdrant_batch_size=qdrant_batch_size,
+                    chunk_tokens=chunk_tokens,
+                    chunk_overlap=chunk_overlap,
                 )
-                ingested += 1
+                status = stats.get("status", "unknown")
+                print(f"- status: {status}")
+                print(f"- documents discovered: {stats.get('documents_discovered', 0)}")
+                print(f"- documents parsed: {stats.get('documents_parsed', 0)}")
+                print(f"- chunks created: {stats.get('chunks_created', 0)}")
+                print(f"- chunks embedded: {stats.get('chunks_embedded', 0)}")
+                print(f"- points stored: {stats.get('points_stored', 0)}")
+                if status == "completed":
+                    ingested += 1
+                else:
+                    ingest_failed += 1
             except Exception as e:
                 ingest_failed += 1
                 print(f"Auto-ingest failed for {source_id}: {e}")
@@ -332,9 +416,17 @@ def run_sources_update(folder_path: str, embedder: str = 'ollama:embeddinggemma'
     print(f"- skipped unsupported: {skipped_unsupported}")
 
 
-def run_sources_delete_all(qdrant_url: str, collection_name: str = None):
+def run_sources_delete_all(qdrant_url: str, collection_name: str = None, embedder: str = BGE_M3_DEFAULT_EMBEDDER):
     """Delete all sources and clear the canonical Qdrant collection."""
-    collection = collection_name or os.getenv("LOCALWIKI_QDRANT_COLLECTION", "local_wiki")
+    collection = collection_name
+    if not collection:
+        resolved = resolve_collection_name(embedder=embedder, collection_name=None)
+        if resolved:
+            collection = resolved
+        else:
+            vector_dim = infer_embedding_dimension(embedder=embedder)
+            collection = collection_name_for_dimension(vector_dim)
+
     registry = IngestionRegistry()
     registry.delete_all_sources()
 
@@ -344,8 +436,10 @@ def run_sources_delete_all(qdrant_url: str, collection_name: str = None):
         client.delete_collection(collection)
         print(f"Deleted Qdrant collection: {collection}")
 
-    create_collection(client, collection_name=collection, vector_dim=768)
+    vector_dim = int(collection.rsplit("_", 1)[-1]) if collection.rsplit("_", 1)[-1].isdigit() else infer_embedding_dimension(embedder=embedder)
+    create_collection(client, collection_name=collection, vector_dim=vector_dim)
     print(f"Recreated empty Qdrant collection: {collection}")
+    print(f"Collection dimension: {vector_dim}")
     print("Deleted all localwiki sources and associated vectors")
 
 
@@ -358,17 +452,41 @@ def run_ingest(args):
     
     # Create Qdrant client
     qdrant_client = initialize_qdrant_client(args.qdrant)
+    collection = resolve_collection_name(embedder=args.embedder, collection_name=args.collection, kb_name=args.kb)
+    collection_label = collection or "auto(local_wiki_<dim>)"
+
+    if args.recreate:
+        if collection and collection_exists(qdrant_client, collection):
+            qdrant_client.delete_collection(collection)
+            print(f"Deleted existing collection: {collection}")
+        print(f"Collection will be created on first embedding batch: {collection_label}")
     
     # Start the ingestion pipeline
-    run_ingestion_pipeline(
+    stats = run_ingestion_pipeline(
         source_id=args.source,
         registry=registry,
         qdrant_client=qdrant_client,
         embedder=args.embedder,
-        kb_name=args.kb
+        kb_name=args.kb,
+        limit=args.limit,
+        collection_name=collection,
+        changed_only=args.changed_only,
+        embed_batch_size=args.embed_batch_size,
+        qdrant_batch_size=args.qdrant_batch_size,
+        chunk_tokens=args.chunk_tokens,
+        chunk_overlap=args.chunk_overlap,
     )
-    
-    print("Ingestion complete!")
+
+    if stats.get("status") == "completed":
+        print("Ingestion complete!")
+    else:
+        print("Ingestion failed")
+    print(f"- status: {stats.get('status', 'unknown')}")
+    print(f"- documents discovered: {stats.get('documents_discovered', 0)}")
+    print(f"- documents parsed: {stats.get('documents_parsed', 0)}")
+    print(f"- chunks created: {stats.get('chunks_created', 0)}")
+    print(f"- chunks embedded: {stats.get('chunks_embedded', 0)}")
+    print(f"- points stored: {stats.get('points_stored', 0)}")
 
 
 def run_search(args):
@@ -376,13 +494,15 @@ def run_search(args):
     print(f"Searching for: {args.query}")
     print(f"Top {args.top} results")
 
-    collection = args.collection or os.getenv("LOCALWIKI_QDRANT_COLLECTION", "local_wiki")
     qdrant_client = initialize_qdrant_client(args.qdrant)
     ollama_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip('/') + "/api/embed"
 
     response = httpx.post(ollama_url, json={"model": args.embedder, "input": [args.query]}, timeout=120.0)
     response.raise_for_status()
     query_vector = response.json()["embeddings"][0]
+    collection = args.collection or resolve_collection_name(embedder=args.embedder, collection_name=None, kb_name=args.kb)
+    if not collection:
+        collection = collection_name_for_dimension(len(query_vector))
 
     results = search_in_collection(qdrant_client, collection, query_vector, args.top, kb_name=args.kb)
     if not results:
@@ -416,6 +536,16 @@ def run_collections_list():
     client = initialize_qdrant_client(os.getenv("QDRANT_URL", "http://127.0.0.1:6333"))
     for name in list_collections(client):
         print(f"- {name}")
+
+
+def run_collections_delete(collection_name: str):
+    """Delete a Qdrant collection if it exists."""
+    client = initialize_qdrant_client(os.getenv("QDRANT_URL", "http://127.0.0.1:6333"))
+    if not collection_exists(client, collection_name):
+        print(f"Collection not found: {collection_name}")
+        return
+    client.delete_collection(collection_name)
+    print(f"Deleted collection: {collection_name}")
 
 
 def run_bridge(args):
@@ -571,10 +701,17 @@ def main():
                 args.path,
                 embedder=args.embedder,
                 qdrant_url=args.qdrant,
+                collection_name=args.collection,
+                limit=args.limit,
+                recreate=args.recreate,
+                embed_batch_size=args.embed_batch_size,
+                qdrant_batch_size=args.qdrant_batch_size,
+                chunk_tokens=args.chunk_tokens,
+                chunk_overlap=args.chunk_overlap,
                 auto_ingest=not args.no_auto_ingest,
             )
         elif args.sources_command == 'delete_all':
-            run_sources_delete_all(args.qdrant, args.collection)
+            run_sources_delete_all(args.qdrant, args.collection, args.embedder)
         else:
             parser.print_help()
     elif args.command == 'ingest':
@@ -586,6 +723,8 @@ def main():
     elif args.command == 'collections':
         if args.collections_command == 'list':
             run_collections_list()
+        elif args.collections_command == 'delete':
+            run_collections_delete(args.collection)
         else:
             parser.print_help()
     elif args.command == 'bridge':

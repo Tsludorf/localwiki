@@ -354,10 +354,18 @@ class ZimParser(BaseParser):
         return fallback
 
     def _crawl_docs_from_search(self, port: int, archive_name: str, zim_file: str) -> List[Dict[str, Any]]:
-        max_docs = int(os.getenv("LOCALWIKI_ZIM_MAX_DOCS", "400"))
+        max_docs = int(os.getenv("LOCALWIKI_ZIM_MAX_DOCS", "10000"))
         per_term_max = int(os.getenv("LOCALWIKI_ZIM_PER_TERM_MAX", "40"))
         min_chars = int(os.getenv("LOCALWIKI_ZIM_MIN_CHARS", "250"))
         max_chars = int(os.getenv("LOCALWIKI_ZIM_MAX_CHARS", "12000"))
+        logger.info(
+            "ZIM search crawl start archive=%s max_docs=%s per_term_max=%s min_chars=%s max_chars=%s",
+            archive_name,
+            max_docs,
+            per_term_max,
+            min_chars,
+            max_chars,
+        )
 
         seed_terms = [
             "a", "e", "i", "o", "u", "the", "history", "science", "city", "person", "country",
@@ -366,10 +374,21 @@ class ZimParser(BaseParser):
 
         seen_sources = set()
         docs: List[Dict[str, Any]] = []
+        total_search_failures = 0
+        total_fetch_failures = 0
+        total_short_docs = 0
+        total_duplicates = 0
+        total_term_caps = 0
 
         for term in seed_terms:
             if len(docs) >= max_docs:
                 break
+
+            term_before = len(docs)
+            term_fetch_failures = 0
+            term_short_docs = 0
+            term_duplicates = 0
+            term_cap_hits = 0
 
             search_url = (
                 f"http://127.0.0.1:{port}/search?content={urllib.parse.quote(archive_name)}"
@@ -379,6 +398,8 @@ class ZimParser(BaseParser):
                 with urllib.request.urlopen(search_url, timeout=60) as r:
                     page = r.read().decode("utf-8", errors="ignore")
             except Exception:
+                total_search_failures += 1
+                logger.warning("ZIM crawl term=%s search request failed", term)
                 continue
 
             for item in self._extract_search_results(page):
@@ -386,16 +407,20 @@ class ZimParser(BaseParser):
                     break
                 source_uri = f"zim://{archive_name}/{item['slug']}"
                 if source_uri in seen_sources:
+                    term_duplicates += 1
                     continue
                 if sum(1 for d in docs if d.get("metadata", {}).get("seed_term") == term) >= per_term_max:
+                    term_cap_hits += 1
                     break
 
                 try:
                     text = self._fetch_article_text(port, item["href"])
                 except Exception:
+                    term_fetch_failures += 1
                     continue
 
                 if len(text) < min_chars:
+                    term_short_docs += 1
                     continue
 
                 text = text[:max_chars].strip()
@@ -415,6 +440,34 @@ class ZimParser(BaseParser):
                     },
                 })
                 seen_sources.add(source_uri)
+
+            term_added = len(docs) - term_before
+            total_fetch_failures += term_fetch_failures
+            total_short_docs += term_short_docs
+            total_duplicates += term_duplicates
+            total_term_caps += term_cap_hits
+            logger.info(
+                "ZIM crawl term=%s added=%s total=%s duplicates=%s short=%s fetch_failures=%s term_cap_hits=%s",
+                term,
+                term_added,
+                len(docs),
+                term_duplicates,
+                term_short_docs,
+                term_fetch_failures,
+                term_cap_hits,
+            )
+
+        logger.info(
+            "ZIM search crawl complete archive=%s docs=%s unique_sources=%s search_failures=%s fetch_failures=%s short_docs=%s duplicates=%s term_cap_hits=%s",
+            archive_name,
+            len(docs),
+            len(seen_sources),
+            total_search_failures,
+            total_fetch_failures,
+            total_short_docs,
+            total_duplicates,
+            total_term_caps,
+        )
 
         return docs
 
@@ -445,9 +498,12 @@ class ZimParser(BaseParser):
         content = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", raw_html)
         content = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", content)
         content = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", content)
+        content = re.sub(r"(?is)</?(p|div|section|article|li|tr|h1|h2|h3|h4|h5|h6|br|hr|ul|ol|table|thead|tbody|tfoot)>", "\n", content)
         content = re.sub(r"(?is)<[^>]+>", " ", content)
         content = html.unescape(content)
-        content = re.sub(r"\s+", " ", content).strip()
+        content = re.sub(r"[ \t]+", " ", content)
+        content = re.sub(r"\n{3,}", "\n\n", content)
+        content = "\n".join(line.strip() for line in content.splitlines() if line.strip())
         return content
 
 
