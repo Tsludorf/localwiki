@@ -65,13 +65,106 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_EMBED_BATCH_SIZE = 64
-DEFAULT_QDRANT_BATCH_SIZE = 256
-DEFAULT_CHUNK_TOKENS = 600
-DEFAULT_CHUNK_OVERLAP = 100
-DEFAULT_MAX_CHUNK_CHARS = 4000
-DEFAULT_MINILM_EMBED_MAX_TOKENS = 600
+DEFAULT_EMBEDDER = "bge-m3:latest"
+
+EMBEDDING_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
+    "all-minilm:latest": {
+        "dimensions": 384,
+        "recommended_use": "Fast ingestion/testing",
+        "chunk_tokens": 128,
+        "chunk_overlap": 32,
+        "embed_batch_size": 64,
+        "max_chunk_chars": 512,
+        "qdrant_batch_size": 256,
+        "collection": "local_wiki_384",
+    },
+    "embeddinggemma:latest": {
+        "dimensions": 768,
+        "recommended_use": "Balanced general-purpose RAG",
+        "chunk_tokens": 600,
+        "chunk_overlap": 100,
+        "embed_batch_size": 64,
+        "max_chunk_chars": 4000,
+        "qdrant_batch_size": 256,
+        "collection": "local_wiki_768",
+    },
+    "bge-m3:latest": {
+        "dimensions": 1024,
+        "recommended_use": "High-quality semantic wiki / long-context retrieval",
+        "chunk_tokens": 800,
+        "chunk_overlap": 150,
+        "embed_batch_size": 16,
+        "max_chunk_chars": 6000,
+        "qdrant_batch_size": 128,
+        "collection": "local_wiki_1024",
+    },
+}
+
+DEFAULT_EMBED_BATCH_SIZE = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["embed_batch_size"]
+DEFAULT_QDRANT_BATCH_SIZE = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["qdrant_batch_size"]
+DEFAULT_CHUNK_TOKENS = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["chunk_tokens"]
+DEFAULT_CHUNK_OVERLAP = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["chunk_overlap"]
+DEFAULT_MAX_CHUNK_CHARS = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["max_chunk_chars"]
 EMBED_CONTEXT_FALLBACK_TOKENS = [600, 384, 300, 192, 128]
+
+def _coalesce_positive_int(override: Optional[int], default_value: int) -> int:
+    if isinstance(override, int) and override > 0:
+        return override
+    return int(default_value)
+
+
+def _canonical_profile_key_for_model(model_name: str) -> Optional[str]:
+    model_low = (model_name or "").lower()
+    if "minilm" in model_low:
+        return "all-minilm:latest"
+    if "embeddinggemma" in model_low:
+        return "embeddinggemma:latest"
+    if "bge-m3" in model_low or "bgem3" in model_low:
+        return "bge-m3:latest"
+    return None
+
+
+def get_embedding_model_profile(embedder: str) -> Dict[str, Any]:
+    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBEDDER))
+    canonical_key = _canonical_profile_key_for_model(model_name)
+    if canonical_key and canonical_key in EMBEDDING_MODEL_PROFILES:
+        profile = dict(EMBEDDING_MODEL_PROFILES[canonical_key])
+    else:
+        profile = {
+            "dimensions": None,
+            "recommended_use": "Custom embedder",
+            "chunk_tokens": DEFAULT_CHUNK_TOKENS,
+            "chunk_overlap": DEFAULT_CHUNK_OVERLAP,
+            "embed_batch_size": DEFAULT_EMBED_BATCH_SIZE,
+            "max_chunk_chars": DEFAULT_MAX_CHUNK_CHARS,
+            "qdrant_batch_size": DEFAULT_QDRANT_BATCH_SIZE,
+            "collection": "",
+        }
+    profile["model_name"] = model_name
+    return profile
+
+
+def resolve_model_ingestion_config(
+    embedder: str,
+    *,
+    embed_batch_size: Optional[int] = None,
+    qdrant_batch_size: Optional[int] = None,
+    chunk_tokens: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+    max_chunk_chars: Optional[int] = None,
+) -> Dict[str, Any]:
+    profile = get_embedding_model_profile(embedder)
+    return {
+        "model_name": profile["model_name"],
+        "dimensions": profile["dimensions"],
+        "recommended_use": profile["recommended_use"],
+        "collection": profile["collection"],
+        "embed_batch_size": _coalesce_positive_int(embed_batch_size, profile["embed_batch_size"]),
+        "qdrant_batch_size": _coalesce_positive_int(qdrant_batch_size, profile["qdrant_batch_size"]),
+        "chunk_tokens": _coalesce_positive_int(chunk_tokens, profile["chunk_tokens"]),
+        "chunk_overlap": _coalesce_positive_int(chunk_overlap, profile["chunk_overlap"]),
+        "max_chunk_chars": _coalesce_positive_int(max_chunk_chars, profile["max_chunk_chars"]),
+    }
 
 
 def _estimate_token_count(text: str) -> int:
@@ -81,9 +174,8 @@ def _estimate_token_count(text: str) -> int:
 def _token_caps_for_retry(initial_cap: int) -> List[int]:
     ordered: List[int] = [max(1, initial_cap)]
     for cap in EMBED_CONTEXT_FALLBACK_TOKENS:
-        if cap not in ordered:
+        if cap < ordered[0] and cap not in ordered:
             ordered.append(cap)
-    ordered = sorted(set(ordered), reverse=True)
     return [cap for cap in ordered if cap > 0]
 
 
@@ -752,25 +844,40 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                           limit: int = 10000,
                           collection_name: Optional[str] = None,
                           changed_only: bool = False,
-                          embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
-                          qdrant_batch_size: int = DEFAULT_QDRANT_BATCH_SIZE,
-                          chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
-                          chunk_overlap: int = DEFAULT_CHUNK_OVERLAP) -> Dict[str, int]:
+                          embed_batch_size: Optional[int] = None,
+                          qdrant_batch_size: Optional[int] = None,
+                          chunk_tokens: Optional[int] = None,
+                          chunk_overlap: Optional[int] = None,
+                          max_chunk_chars: Optional[int] = None) -> Dict[str, int]:
     """
     Run the full ingestion pipeline for a source.
     """
     logger.info(f"Starting ingestion pipeline for source: {source_id}")
     run_started_at = time.time()
-    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", "all-minilm"))
+    ingestion_config = resolve_model_ingestion_config(
+        embedder=embedder,
+        embed_batch_size=embed_batch_size,
+        qdrant_batch_size=qdrant_batch_size,
+        chunk_tokens=chunk_tokens,
+        chunk_overlap=chunk_overlap,
+        max_chunk_chars=max_chunk_chars,
+    )
+    model_name = ingestion_config["model_name"]
+    effective_embed_batch_size = ingestion_config["embed_batch_size"]
+    effective_qdrant_batch_size = ingestion_config["qdrant_batch_size"]
+    effective_chunk_tokens = ingestion_config["chunk_tokens"]
+    effective_chunk_overlap = ingestion_config["chunk_overlap"]
+    effective_max_chunk_chars = ingestion_config["max_chunk_chars"]
+
     effective_limit = limit if (limit and limit > 0) else None
     print(f"[Ingestion Start] source={source_id} model={model_name} kb={kb_name}")
     print(
         "[Ingestion Config] "
-        f"chunk_tokens={chunk_tokens} "
-        f"chunk_overlap={chunk_overlap} "
-        f"embed_batch_size={embed_batch_size} "
-        f"qdrant_batch_size={qdrant_batch_size} "
-        f"max_chunk_chars={DEFAULT_MAX_CHUNK_CHARS} "
+        f"chunk_tokens={effective_chunk_tokens} "
+        f"chunk_overlap={effective_chunk_overlap} "
+        f"embed_batch_size={effective_embed_batch_size} "
+        f"qdrant_batch_size={effective_qdrant_batch_size} "
+        f"max_chunk_chars={effective_max_chunk_chars} "
         f"changed_only={changed_only} "
         f"limit={effective_limit if effective_limit is not None else 'unlimited'} "
         f"collection_override={collection_name or 'auto'}"
@@ -973,14 +1080,14 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                         doc_key=doc_key,
                     )
 
-                    chunker = Chunker(max_tokens=chunk_tokens, overlap_tokens=chunk_overlap, min_tokens=300)
+                    chunker = Chunker(max_tokens=effective_chunk_tokens, overlap_tokens=effective_chunk_overlap, min_tokens=300)
                     chunks_list = chunker.chunk_text(text, "", metadata)
                     item_chunks_raw += len(chunks_list)
 
                     chunked_data = []
                     for chunk_data in chunks_list:
-                        if len(chunk_data["chunk_text"]) > DEFAULT_MAX_CHUNK_CHARS:
-                            chunk_data["chunk_text"] = chunk_data["chunk_text"][:DEFAULT_MAX_CHUNK_CHARS]
+                        if len(chunk_data["chunk_text"]) > effective_max_chunk_chars:
+                            chunk_data["chunk_text"] = chunk_data["chunk_text"][:effective_max_chunk_chars]
                             item_chunks_truncated += 1
                         if _is_low_value_chunk(chunk_data["chunk_text"], title=title):
                             item_chunks_low_value += 1
@@ -1022,8 +1129,10 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                         source,
                         kb_name,
                         collection_name=collection_name,
-                        embed_batch_size=embed_batch_size,
-                        qdrant_batch_size=qdrant_batch_size,
+                        embed_batch_size=effective_embed_batch_size,
+                        qdrant_batch_size=effective_qdrant_batch_size,
+                        embed_max_tokens=effective_chunk_tokens,
+                        max_chunk_chars=effective_max_chunk_chars,
                     )
                     stats["chunks_created"] += embed_stats["chunks_embedded"]
                     stats["chunks_embedded"] += embed_stats["chunks_embedded"]
@@ -1116,10 +1225,10 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
         stats["status"] = "failed"
         return stats
 
-def _resolve_embed_model(embedder: str) -> str:
-    if embedder.startswith("ollama:"):
+def _resolve_embed_model(embedder: Optional[str]) -> str:
+    if embedder and embedder.startswith("ollama:"):
         return embedder.split(":", 1)[1]
-    model = embedder or os.getenv("OLLAMA_EMBED_MODEL", "all-minilm:latest")
+    model = embedder or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBEDDER)
     if ":" not in model:
         return f"{model}:latest"
     return model
@@ -1147,25 +1256,21 @@ def _truncate_text_for_embedding(text: str, max_tokens: int, max_chars: int) -> 
 def _collection_name_for(kb_name: str, model_name: str, collection_name: Optional[str] = None) -> str:
     if collection_name:
         return collection_name
+    profile_key = _canonical_profile_key_for_model(model_name)
+    if profile_key:
+        return EMBEDDING_MODEL_PROFILES[profile_key]["collection"]
     return ""
 
 
 def resolve_collection_name(embedder: str, collection_name: Optional[str] = None, kb_name: str = "") -> str:
     if collection_name:
         return collection_name
-    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", "all-minilm:latest"))
-    model_low = model_name.lower()
-    if "minilm" in model_low:
-        return "local_wiki_384"
-    if "embeddinggemma" in model_low:
-        return "local_wiki_768"
-    if "bge-m3" in model_low or "bgem3" in model_low:
-        return "local_wiki_1024"
-    return ""
+    profile = get_embedding_model_profile(embedder)
+    return profile.get("collection", "")
 
 
 def infer_embedding_dimension(embedder: str, ollama_url: Optional[str] = None) -> int:
-    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", "all-minilm:latest"))
+    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBEDDER))
     url = (ollama_url or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/") + "/api/embed"
     with httpx.Client(timeout=60.0) as client:
         response = client.post(url, json={"model": model_name, "input": ["dimension probe"]})
@@ -1248,6 +1353,8 @@ def _embed_texts(
     model_name: str,
     ollama_url: str,
     batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+    max_tokens: Optional[int] = None,
+    max_chars: Optional[int] = None,
 ) -> Tuple[List[List[float]], List[int]]:
     if not texts:
         return [], []
@@ -1255,9 +1362,10 @@ def _embed_texts(
     url = ollama_url.rstrip("/") + "/api/embed"
     batch_size = max(1, batch_size)
     configured_max_tokens = int(os.getenv("LOCALWIKI_EMBED_MAX_TOKENS", "0"))
-    default_max_tokens = DEFAULT_MINILM_EMBED_MAX_TOKENS if "minilm" in model_name.lower() else DEFAULT_CHUNK_TOKENS
+    default_max_tokens = _coalesce_positive_int(max_tokens, DEFAULT_CHUNK_TOKENS)
     initial_max_tokens = configured_max_tokens if configured_max_tokens > 0 else default_max_tokens
-    initial_max_chars = int(os.getenv("LOCALWIKI_EMBED_MAX_CHARS", str(DEFAULT_MAX_CHUNK_CHARS)))
+    configured_max_chars = int(os.getenv("LOCALWIKI_EMBED_MAX_CHARS", "0"))
+    initial_max_chars = configured_max_chars if configured_max_chars > 0 else _coalesce_positive_int(max_chars, DEFAULT_MAX_CHUNK_CHARS)
     token_caps = _token_caps_for_retry(initial_max_tokens)
     timeout_seconds = float(os.getenv("LOCALWIKI_EMBED_TIMEOUT_SECONDS", "600"))
 
@@ -1395,7 +1503,9 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
                           source_item: SourceItem, source: Source, kb_name: str,
                           collection_name: Optional[str] = None,
                           embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
-                          qdrant_batch_size: int = DEFAULT_QDRANT_BATCH_SIZE) -> Dict[str, int]:
+                          qdrant_batch_size: int = DEFAULT_QDRANT_BATCH_SIZE,
+                          embed_max_tokens: Optional[int] = None,
+                          max_chunk_chars: Optional[int] = None) -> Dict[str, int]:
     """
     Embed chunks and store in Qdrant.
     """
@@ -1403,7 +1513,7 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
     if not chunks:
         return stats
 
-    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", "all-minilm:latest"))
+    model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBEDDER))
     ollama_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
     resolved_collection_name = _collection_name_for(kb_name, model_name, collection_name)
     precheck_collection_name = resolved_collection_name or collection_name
@@ -1458,7 +1568,14 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
 
     logger.info(f"Encoding {len(prepared_items)} chunks for document {document.doc_id}")
     embed_texts = [item["embed_text"] for item in prepared_items]
-    embeddings, kept_indices = _embed_texts(embed_texts, model_name, ollama_url, batch_size=embed_batch_size)
+    embeddings, kept_indices = _embed_texts(
+        embed_texts,
+        model_name,
+        ollama_url,
+        batch_size=embed_batch_size,
+        max_tokens=embed_max_tokens,
+        max_chars=max_chunk_chars,
+    )
     embedded_items = [prepared_items[idx] for idx in kept_indices]
 
     if not embedded_items:

@@ -12,7 +12,17 @@ from pathlib import Path
 # Add src to Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from core import IngestionRegistry, Source, SourceItem, BaseParser, CanonicalDocument, detect_source_type_and_mime, _build_embedding_text
+from core import (
+    IngestionRegistry,
+    Source,
+    SourceItem,
+    BaseParser,
+    CanonicalDocument,
+    detect_source_type_and_mime,
+    _build_embedding_text,
+    resolve_collection_name,
+    resolve_model_ingestion_config,
+)
 from parsers import ParserFactory
 import pytest
 
@@ -106,6 +116,35 @@ def test_build_embedding_text_includes_context():
     assert "Source: folder/notes.txt" in embedded
     assert "Source Type: text" in embedded
     assert embedded.endswith(chunk_text)
+
+
+def test_resolve_collection_name_from_embedder_profile():
+    assert resolve_collection_name(embedder="all-minilm:latest") == "local_wiki_384"
+    assert resolve_collection_name(embedder="embeddinggemma") == "local_wiki_768"
+    assert resolve_collection_name(embedder="bge-m3:latest") == "local_wiki_1024"
+
+
+def test_resolve_model_ingestion_config_profile_and_overrides():
+    profile_cfg = resolve_model_ingestion_config(embedder="all-minilm:latest")
+    assert profile_cfg["chunk_tokens"] == 128
+    assert profile_cfg["chunk_overlap"] == 32
+    assert profile_cfg["embed_batch_size"] == 64
+    assert profile_cfg["qdrant_batch_size"] == 256
+    assert profile_cfg["max_chunk_chars"] == 512
+
+    override_cfg = resolve_model_ingestion_config(
+        embedder="all-minilm:latest",
+        chunk_tokens=256,
+        chunk_overlap=48,
+        embed_batch_size=16,
+        qdrant_batch_size=64,
+        max_chunk_chars=1024,
+    )
+    assert override_cfg["chunk_tokens"] == 256
+    assert override_cfg["chunk_overlap"] == 48
+    assert override_cfg["embed_batch_size"] == 16
+    assert override_cfg["qdrant_batch_size"] == 64
+    assert override_cfg["max_chunk_chars"] == 1024
 
 def test_registry_initialization():
     """Test that the registry initializes correctly."""

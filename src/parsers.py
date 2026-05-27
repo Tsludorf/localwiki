@@ -10,6 +10,7 @@ import logging
 import subprocess
 import time
 import os
+import socket
 import urllib.request
 import urllib.parse
 import re
@@ -192,28 +193,42 @@ class ZimParser(BaseParser):
             raise RuntimeError(error_msg)
             
         try:
-            # Get the ZIM file path from source_item
             zim_file = source_item.uri
-            
-            file_size = Path(zim_file).stat().st_size
-            content = ""
+            docs = self.parse_documents(source_item)
+            if not docs:
+                metadata = {
+                    "source_type": "zim",
+                    "file_size": Path(zim_file).stat().st_size,
+                    "zim_file": Path(zim_file).name,
+                    "source_uri": source_item.uri,
+                    "entry_count": 0,
+                }
+                return "", metadata
+
+            max_concat_docs = max(1, int(os.getenv("LOCALWIKI_ZIM_PARSE_MAX_DOCS", "10")))
+            max_concat_chars = max(256, int(os.getenv("LOCALWIKI_ZIM_PARSE_MAX_CHARS", "120000")))
+
+            selected_docs = docs[:max_concat_docs]
+            content_parts: List[str] = []
+            for doc in selected_docs:
+                title = (doc.get("title") or "Untitled").strip()
+                text = (doc.get("text") or "").strip()
+                if not text:
+                    continue
+                content_parts.append(f"Title: {title}\n\n{text}")
+
+            content = "\n\n".join(content_parts).strip()[:max_concat_chars]
             metadata = {
                 "source_type": "zim",
-                "file_size": file_size,
+                "file_size": Path(zim_file).stat().st_size,
                 "zim_file": Path(zim_file).name,
                 "source_uri": source_item.uri,
-                "entry_count": 0,
+                "entry_count": len(docs),
+                "concatenated_docs": len(selected_docs),
             }
-
-            query = "Albert Einstein"
-            search = subprocess.run(["kiwix-search", zim_file, query], capture_output=True, text=True, timeout=60)
-            if search.returncode != 0:
-                raise RuntimeError(search.stderr or "kiwix-search failed")
-            content = search.stdout
-            
-            logger.info(f"Parsed ZIM file: {Path(zim_file).name} with {metadata['entry_count']} entries")
+            logger.info("Parsed ZIM file: %s with %s entries", Path(zim_file).name, len(docs))
             return content, metadata
-            
+
         except Exception as e:
             logger.error(f"Failed to parse ZIM file {source_item.uri}: {e}")
             raise
@@ -222,11 +237,10 @@ class ZimParser(BaseParser):
         if not self.kiwix_available:
             raise RuntimeError("kiwix tools unavailable")
         zim_file = source_item.uri
-        port = 18080
+        port = self._reserve_local_port()
         proc = subprocess.Popen(["kiwix-serve", "--port", str(port), zim_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            time.sleep(2)
-            archive_name = self._discover_archive_name(port)
+            archive_name = self._wait_for_kiwix_ready(port, proc)
             try:
                 entries = self._enumerate_entries_from_data_js(port, archive_name)
             except Exception as e:
@@ -235,18 +249,11 @@ class ZimParser(BaseParser):
                 if docs:
                     logger.info("Parsed %s ZIM article docs from %s via search crawl", len(docs), zim_file)
                     return docs
-                logger.warning("Search crawl returned 0 docs for %s; using minimal kiwix-search fallback", zim_file)
-                text, metadata = self.parse(source_item)
-                if not text.strip():
-                    return []
-                title = Path(zim_file).stem
-                return [{
-                    "title": title,
-                    "text": text,
-                    "source_uri": source_item.uri,
-                    "source_type": "zim",
-                    "metadata": {**metadata, "fallback": "kiwix-search-minimal"},
-                }]
+                logger.warning("Search crawl returned 0 docs for %s; using minimal source-driven fallback", zim_file)
+                fallback_doc = self._minimal_doc_from_search(port, archive_name, zim_file)
+                if fallback_doc:
+                    return [fallback_doc]
+                return []
             discovered_entries = len(entries)
             logger.info("ZIM entries discovered: %s (archive=%s)", discovered_entries, archive_name)
 
@@ -307,7 +314,41 @@ class ZimParser(BaseParser):
 
             return docs
         finally:
-            proc.terminate()
+            self._stop_process(proc)
+
+    def _reserve_local_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _wait_for_kiwix_ready(self, port: int, proc: subprocess.Popen) -> str:
+        timeout_seconds = max(1.0, float(os.getenv("LOCALWIKI_KIWIX_READY_TIMEOUT_SECONDS", "30")))
+        poll_seconds = max(0.05, float(os.getenv("LOCALWIKI_KIWIX_READY_POLL_SECONDS", "0.25")))
+        deadline = time.time() + timeout_seconds
+        last_error = ""
+
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError("kiwix-serve exited before becoming ready")
+            try:
+                return self._discover_archive_name(port)
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(poll_seconds)
+
+        raise RuntimeError(
+            f"Timed out waiting for kiwix-serve on port {port}: {last_error or 'unknown readiness error'}"
+        )
+
+    def _stop_process(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=5)
 
     def _discover_archive_name(self, port: int) -> str:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/catalog/v2/entries?count=1", timeout=20) as r:
@@ -352,6 +393,56 @@ class ZimParser(BaseParser):
                     default = text
             return preferred or default or first or fallback
         return fallback
+
+    def _minimal_doc_from_search(self, port: int, archive_name: str, zim_file: str) -> Dict[str, Any] | None:
+        """Fetch one representative article from ZIM search without hardcoded topic bias."""
+        min_chars = int(os.getenv("LOCALWIKI_ZIM_MIN_CHARS", "250"))
+        max_chars = int(os.getenv("LOCALWIKI_ZIM_MAX_CHARS", "12000"))
+        configured_terms = os.getenv("LOCALWIKI_ZIM_FALLBACK_TERMS", "history,science,world,article,the,a")
+        seed_terms = [t.strip() for t in configured_terms.split(",") if t.strip()]
+
+        for term in seed_terms:
+            search_url = (
+                f"http://127.0.0.1:{port}/search?content={urllib.parse.quote(archive_name)}"
+                f"&pattern={urllib.parse.quote(term)}"
+            )
+            try:
+                with urllib.request.urlopen(search_url, timeout=60) as r:
+                    page = r.read().decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            results = self._extract_search_results(page)
+            for item in results:
+                try:
+                    text = self._fetch_article_text(port, item["href"])
+                except Exception:
+                    continue
+
+                if len(text) < min_chars:
+                    continue
+
+                text = text[:max_chars].strip()
+                source_uri = f"zim://{archive_name}/{item['slug']}"
+                return {
+                    "title": item["title"],
+                    "text": text,
+                    "source_uri": source_uri,
+                    "source_type": "zim",
+                    "metadata": {
+                        "source_type": "zim",
+                        "source_uri": source_uri,
+                        "title": item["title"],
+                        "archive": archive_name,
+                        "zim_file": Path(zim_file).name,
+                        "fallback": "search-minimal-source-driven",
+                        "seed_term": term,
+                        "href": item["href"],
+                    },
+                }
+
+        logger.warning("Minimal ZIM fallback failed for %s (archive=%s)", zim_file, archive_name)
+        return None
 
     def _crawl_docs_from_search(self, port: int, archive_name: str, zim_file: str) -> List[Dict[str, Any]]:
         max_docs = int(os.getenv("LOCALWIKI_ZIM_MAX_DOCS", "10000"))
