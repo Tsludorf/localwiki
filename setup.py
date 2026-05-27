@@ -11,6 +11,7 @@ setup(
     },
     install_requires=[
         'qdrant-client>=1.8.0',
+        'httpx>=0.27.0',
         'click>=8.1.0',
         'requests>=2.31.0',
         'pyyaml>=6.0.0',

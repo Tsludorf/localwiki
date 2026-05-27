@@ -902,6 +902,7 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
     
     if not source:
         logger.error(f"Source {source_id} not found")
+        stats["status"] = "failed"
         return stats
         
     run = IngestionRun(

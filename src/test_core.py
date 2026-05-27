@@ -9,8 +9,11 @@ import tempfile
 import shutil
 from pathlib import Path
 
-# Add src to Python path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Add project root and src to Python path for direct execution
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = PROJECT_ROOT / "src"
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SRC_ROOT))
 
 from core import (
     IngestionRegistry,
