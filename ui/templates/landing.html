@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LocalWiki Query Landing</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="topbar">
+      <div>
+        <h1>LocalWiki Query Console</h1>
+        <p class="subtitle">Query indexed data through AnythingLLM and inspect loaded sources</p>
+      </div>
+      <a class="nav-link" href="/dashboard">Open System Dashboard</a>
+    </header>
+
+    <section class="overall good">
+      <h2>AnythingLLM Query</h2>
+      <p class="help">Base URL: <code>{{ anythingllm_base_url }}</code></p>
+      <div class="update-bar">
+        <label for="workspaceSlug"><strong>Workspace:</strong></label>
+        <input id="workspaceSlug" type="text" value="{{ default_workspace }}" />
+      </div>
+      <div class="update-bar">
+        <label for="apiKey"><strong>API Key:</strong></label>
+        <input id="apiKey" type="password" placeholder="AnythingLLM API key" />
+      </div>
+      <div class="update-bar">
+        <label for="queryPrompt"><strong>Question:</strong></label>
+        <input id="queryPrompt" type="text" placeholder="Ask a question about your ingested sources" />
+        <button id="runQueryBtn">Run Query</button>
+      </div>
+      <pre id="queryResult">No query run yet.</pre>
+    </section>
+
+    <section>
+      <h2>Loaded Sources</h2>
+      <p class="help">List view of all LocalWiki sources and ingestion state.</p>
+      <ul id="sourcesList" class="source-list"></ul>
+    </section>
+  </main>
+
+<script>
+const workspaceSlugEl = document.getElementById('workspaceSlug');
+const apiKeyEl = document.getElementById('apiKey');
+const queryPromptEl = document.getElementById('queryPrompt');
+const runQueryBtn = document.getElementById('runQueryBtn');
+const queryResultEl = document.getElementById('queryResult');
+const sourcesListEl = document.getElementById('sourcesList');
+
+function esc(str) {
+  return String(str)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+function formatDateEST(value) {
+  if (!value) return 'n/a';
+  let date;
+  if (typeof value === 'number' || /^\d+$/.test(String(value))) {
+    date = new Date(Number(value) * 1000);
+  } else {
+    date = new Date(value);
+  }
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: 'short', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: true, timeZoneName: 'short',
+  }).format(date);
+}
+
+function renderQueryResult(data) {
+  const chunks = [
+    `Status: ${data.ok ? 'OK' : 'FAILED'}${data.status_code ? ` (HTTP ${data.status_code})` : ''}`,
+    `Latency: ${data.latency_ms ?? 'n/a'}ms`,
+    `Workspace: ${data.workspace_slug || 'n/a'}`,
+    `Requested: ${formatDateEST(data.requested_at)}`,
+  ];
+
+  if (data.answer) {
+    chunks.push('', 'ANSWER', '------', data.answer);
+  }
+
+  if (data.error) {
+    chunks.push('', 'ERROR', '-----', data.error);
+  }
+
+  if (data.body && !data.answer) {
+    chunks.push('', 'RAW RESPONSE', '------------', JSON.stringify(data.body, null, 2));
+  }
+
+  queryResultEl.textContent = chunks.join('\n');
+}
+
+function renderSourcesList(status) {
+  const sources = status.sources || [];
+  if (!sources.length) {
+    sourcesListEl.innerHTML = '<li>No sources loaded yet.</li>';
+    return;
+  }
+
+  sourcesListEl.innerHTML = sources.map((src) => {
+    const loaded = Number(src.loaded_count || 0);
+    const newFiles = Number(src.not_loaded_count || 0);
+    const stateClass = newFiles === 0 ? 'badge-good' : 'badge-bad';
+    const stateLabel = newFiles === 0 ? 'Ready' : 'Needs update';
+
+    return `
+      <li>
+        <strong>${esc(src.display_name || src.source_id)}</strong>
+        <span class="badge ${stateClass}">${stateLabel}</span><br>
+        Type: ${esc(src.source_type)} | Loaded: ${loaded} | New files: ${newFiles}<br>
+        Added: ${esc(formatDateEST(src.added_at))}<br>
+        Path: <code>${esc(src.root_uri)}</code>
+      </li>
+    `;
+  }).join('');
+}
+
+async function refreshSources() {
+  try {
+    const res = await fetch('/api/localwiki/status', { cache: 'no-store' });
+    const data = await res.json();
+    renderSourcesList(data);
+  } catch (err) {
+    sourcesListEl.innerHTML = `<li>Failed to load sources: ${esc(err)}</li>`;
+  }
+}
+
+async function runQuery() {
+  const prompt = (queryPromptEl.value || '').trim();
+  const workspace_slug = (workspaceSlugEl.value || '').trim();
+  const api_key = (apiKeyEl.value || '').trim();
+
+  if (!prompt) {
+    queryResultEl.textContent = 'Enter a question first.';
+    return;
+  }
+
+  queryResultEl.textContent = 'Running query...';
+  try {
+    const res = await fetch('/api/anythingllm/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, workspace_slug, api_key }),
+    });
+    const data = await res.json();
+    renderQueryResult(data);
+  } catch (err) {
+    queryResultEl.textContent = `Query request failed: ${err}`;
+  }
+}
+
+runQueryBtn.addEventListener('click', runQuery);
+queryPromptEl.addEventListener('keydown', (evt) => {
+  if (evt.key === 'Enter') {
+    runQuery();
+  }
+});
+
+refreshSources();
+setInterval(refreshSources, 60_000);
+</script>
+</body>
+</html>

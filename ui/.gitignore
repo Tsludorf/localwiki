@@ -1,0 +1,4 @@
+.venv/
+__pycache__/
+*.pyc
+data/ports_snapshot.json
