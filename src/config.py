@@ -21,16 +21,16 @@ class ConfigManager:
                 "mode": "mode2",  # mode1 or mode2
                 "resume_enabled": True,
                 "deduplication": True,
-                "chunk_size": 512,
-                "chunk_overlap": 64
+                "chunk_size": 800,
+                "chunk_overlap": 150
             },
             "embedding": {
-                "model": "nomic-embed-text",
-                "dimensions": 768,
-                "ollama_url": "http://localhost:11434"
+                "model": "bge-m3:latest",
+                "dimensions": 1024,
+                "ollama_url": "http://127.0.0.1:11434"
             },
             "qdrant": {
-                "url": "http://localhost:6333",
+                "url": "http://127.0.0.1:6333",
                 "timeout": 5.0
             },
             "anythingllm": {
