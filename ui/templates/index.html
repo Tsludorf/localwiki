@@ -219,12 +219,31 @@ function formatDateEST(value) {
 }
 
 function activateTab(tabName) {
+  const requested = String(tabName || '').trim();
+  const valid = Array.from(tabPanels).some((panel) => panel.id === requested);
+  const activeTab = valid ? requested : 'servicesTab';
+
   tabButtons.forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.tabTarget === tabName);
+    btn.classList.toggle('active', btn.dataset.tabTarget === activeTab);
   });
   tabPanels.forEach((panel) => {
-    panel.classList.toggle('active', panel.id === tabName);
+    panel.classList.toggle('active', panel.id === activeTab);
   });
+
+  const tabSlug = activeTab.replace(/Tab$/, '').replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`).replace(/^-/, '');
+  const url = new URL(window.location.href);
+  url.searchParams.set('tab', tabSlug);
+  window.history.replaceState({}, '', `${url.pathname}?${url.searchParams.toString()}`);
+}
+
+function getInitialTabFromUrl() {
+  const tab = new URLSearchParams(window.location.search).get('tab');
+  if (!tab) return 'servicesTab';
+  const normalized = tab.toLowerCase();
+  if (normalized === 'services') return 'servicesTab';
+  if (normalized === 'localwiki') return 'localwikiTab';
+  if (normalized === 'factset-oauth') return 'factsetTab';
+  return 'servicesTab';
 }
 
 function setTabStatus(el, healthy) {
@@ -610,7 +629,7 @@ document.querySelectorAll('[data-cmd]').forEach((btn) => {
 tabButtons.forEach((btn) => {
   btn.addEventListener('click', () => activateTab(btn.dataset.tabTarget));
 });
-activateTab('servicesTab');
+activateTab(getInitialTabFromUrl());
 refresh();
 setInterval(refresh, 60_000);
 </script>
