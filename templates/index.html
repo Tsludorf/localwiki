@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local AI Status</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="topbar">
+      <div>
+        <h1>Local AI Health Dashboard</h1>
+        <p class="subtitle">Simple health view of your local AI services</p>
+      </div>
+      <button id="refreshBtn">Refresh now</button>
+    </header>
+
+    <section id="overall" class="overall loading">
+      <h2>Overall status: Checking...</h2>
+      <p id="meta">Loading latest data...</p>
+      <div id="quickStats" class="quick-stats"></div>
+    </section>
+
+    <nav class="tabs" aria-label="Dashboard tabs">
+      <button class="tab active" data-tab-target="servicesTab">
+        Services
+        <span id="servicesTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+      </button>
+      <button class="tab" data-tab-target="localwikiTab">
+        LocalWiki
+        <span id="localwikiTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+      </button>
+      <button class="tab" data-tab-target="factsetTab">
+        FactSet OAuth
+        <span id="factsetTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+      </button>
+    </nav>
+
+    <section id="servicesTab" class="tab-panel active">
+      <section>
+        <h2>Services</h2>
+        <p class="help">Tip: Green means healthy. Red means needs attention. Click a service to see full details.</p>
+        <div id="services" class="cards"></div>
+        <pre id="serviceActionOutput">No service restart run yet.</pre>
+      </section>
+
+      <section>
+        <h2>Port Snapshot (backup saved)</h2>
+        <pre id="ports"></pre>
+      </section>
+
+      <section>
+        <h2>Raw JSON Snapshot</h2>
+        <pre id="raw"></pre>
+      </section>
+    </section>
+
+    <section id="localwikiTab" class="tab-panel">
+      <section>
+        <h2>LocalWiki CLI</h2>
+        <p class="help">Run LocalWiki checks from this UI using <code>/home/loc-llm/warlock_ingester/.venv</code>.</p>
+        <div class="update-bar">
+          <label for="updatePath"><strong>Sources folder:</strong></label>
+          <input id="updatePath" type="text" value="/home/loc-llm/Desktop/wiki_sources" />
+          <label class="check-inline"><input id="updateNoAuto" type="checkbox" /> no auto-ingest</label>
+          <button id="sourcesUpdateBtn">Run sources update</button>
+        </div>
+        <div class="cli-toolbar">
+          <button id="venvStartBtn">Start LocalWiki venv</button>
+          <button class="secondary" data-cmd="status">Run status</button>
+          <button class="secondary" data-cmd="help">Run help</button>
+          <button class="secondary" data-cmd="collections_list">List collections</button>
+          <button class="secondary" data-cmd="troubleshoot">Run troubleshoot</button>
+        </div>
+        <pre id="localwikiCommand"></pre>
+      </section>
+
+      <section>
+        <h2>LocalWiki Loaded Files</h2>
+        <div id="localwikiSummary" class="quick-stats"></div>
+        <div id="localwikiSources" class="cards"></div>
+      </section>
+    </section>
+
+    <section id="factsetTab" class="tab-panel">
+      <section>
+        <h2>FactSet OAuth</h2>
+        <p class="help">Server-side OAuth 2.0 client-credentials setup for FactSet SDK integrations.</p>
+        <div class="factset-grid">
+          <article class="card">
+            <h3>FactSet OAuth Status</h3>
+            <div id="factsetStatusGrid" class="status-grid"></div>
+          </article>
+          <article class="card">
+            <h3>Credential Configuration</h3>
+            <label for="factsetConfigPath"><strong>FactSet app-config.json path:</strong></label>
+            <input id="factsetConfigPath" type="text" placeholder="./data/secrets/factset/app-config.json" />
+            <div class="factset-actions">
+              <button id="factsetSaveBtn">Save Config Path</button>
+              <button id="factsetTestBtn" class="secondary">Test FactSet OAuth</button>
+              <button id="factsetClearBtn" class="secondary">Clear Config</button>
+            </div>
+            <label for="factsetConfigUpload"><strong>Upload app-config.json:</strong></label>
+            <input id="factsetConfigUpload" type="file" accept="application/json,.json" />
+            <div class="factset-actions">
+              <button id="factsetUploadBtn">Upload Config File</button>
+              <button id="factsetRefreshBtn" class="secondary">Refresh SDK Status</button>
+            </div>
+            <pre id="factsetMessage">No action run yet.</pre>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>SDK / Package Readiness</h2>
+        <table id="factsetSdkTable" class="sdk-table">
+          <thead><tr><th>Package</th><th>Status</th><th>Version</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="help">Install command:</p>
+        <pre>source /home/loc-llm/warlock_ingester/.venv/bin/activate
+python -m pip install fds.sdk.utils fds.sdk.FactSetEntity fds.sdk.FactSetFundamentals fds.sdk.FactSetEstimates fds.sdk.FactSetPrices fds.sdk.GlobalFilings fds.sdk.Formula fds.sdk.FactSetNER</pre>
+      </section>
+
+      <section>
+        <h2>Integration Notes</h2>
+        <ul>
+          <li>FactSet OAuth uses server-side client-credentials authentication.</li>
+          <li>The dashboard stores only a config path or uploaded filename metadata.</li>
+          <li>Access tokens and private-key material are never sent to the browser.</li>
+          <li>This setup prepares LocalWiki for future FactSet ingestion connectors.</li>
+        </ul>
+      </section>
+    </section>
+  </main>
+
+<script>
+const servicesEl = document.getElementById('services');
+const metaEl = document.getElementById('meta');
+const portsEl = document.getElementById('ports');
+const rawEl = document.getElementById('raw');
+const refreshBtn = document.getElementById('refreshBtn');
+const overallEl = document.getElementById('overall');
+const quickStatsEl = document.getElementById('quickStats');
+const venvStartBtn = document.getElementById('venvStartBtn');
+const localwikiCommandEl = document.getElementById('localwikiCommand');
+const localwikiSummaryEl = document.getElementById('localwikiSummary');
+const localwikiSourcesEl = document.getElementById('localwikiSources');
+const updatePathEl = document.getElementById('updatePath');
+const updateNoAutoEl = document.getElementById('updateNoAuto');
+const sourcesUpdateBtn = document.getElementById('sourcesUpdateBtn');
+const tabButtons = document.querySelectorAll('[data-tab-target]');
+const tabPanels = document.querySelectorAll('.tab-panel');
+const servicesTabStatusEl = document.getElementById('servicesTabStatus');
+const localwikiTabStatusEl = document.getElementById('localwikiTabStatus');
+const factsetTabStatusEl = document.getElementById('factsetTabStatus');
+const serviceActionOutputEl = document.getElementById('serviceActionOutput');
+const factsetStatusGridEl = document.getElementById('factsetStatusGrid');
+const factsetSdkTbodyEl = document.querySelector('#factsetSdkTable tbody');
+const factsetConfigPathEl = document.getElementById('factsetConfigPath');
+const factsetConfigUploadEl = document.getElementById('factsetConfigUpload');
+const factsetMessageEl = document.getElementById('factsetMessage');
+const factsetSaveBtn = document.getElementById('factsetSaveBtn');
+const factsetUploadBtn = document.getElementById('factsetUploadBtn');
+const factsetTestBtn = document.getElementById('factsetTestBtn');
+const factsetClearBtn = document.getElementById('factsetClearBtn');
+const factsetRefreshBtn = document.getElementById('factsetRefreshBtn');
+
+function esc(str) {
+  return String(str)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
+
+function formatUptime(totalSeconds) {
+  const s = Number(totalSeconds || 0);
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  const secs = s % 60;
+  const chunks = [];
+  if (days) chunks.push(`${days}d`);
+  if (hours || days) chunks.push(`${hours}h`);
+  if (mins || hours || days) chunks.push(`${mins}m`);
+  chunks.push(`${secs}s`);
+  return chunks.join(' ');
+}
+
+function friendlyStatus(status) {
+  return status === 'up' ? 'Healthy' : 'Down';
+}
+
+function formatDateEST(value) {
+  if (!value) return 'n/a';
+
+  let date;
+  if (typeof value === 'number' || /^\d+$/.test(String(value))) {
+    const secs = Number(value);
+    date = new Date(secs * 1000);
+  } else {
+    date = new Date(value);
+  }
+
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  }).format(date);
+}
+
+function activateTab(tabName) {
+  tabButtons.forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tabTarget === tabName);
+  });
+  tabPanels.forEach((panel) => {
+    panel.classList.toggle('active', panel.id === tabName);
+  });
+}
+
+function setTabStatus(el, healthy) {
+  el.classList.toggle('tab-dot-good', healthy);
+  el.classList.toggle('tab-dot-bad', !healthy);
+}
+
+function renderOverall(services, generatedAt) {
+  const total = services.length;
+  const up = services.filter(s => s.status === 'up').length;
+  const down = total - up;
+
+  let label = 'All services healthy';
+  let css = 'good';
+  if (down > 0 && up > 0) {
+    label = 'Some services need attention';
+    css = 'warn';
+  } else if (down === total) {
+    label = 'All services are down';
+    css = 'bad';
+  }
+
+  overallEl.className = `overall ${css}`;
+  overallEl.querySelector('h2').textContent = `Overall status: ${label}`;
+  metaEl.textContent = `Last update: ${formatDateEST(generatedAt)} | Auto-refresh every 60 seconds`;
+
+  quickStatsEl.innerHTML = `
+    <div class="stat good"><strong>${up}</strong><span>Healthy</span></div>
+    <div class="stat bad"><strong>${down}</strong><span>Down</span></div>
+    <div class="stat"><strong>${total}</strong><span>Total</span></div>
+  `;
+
+  setTabStatus(servicesTabStatusEl, down === 0 && total > 0);
+}
+
+function renderServices(services) {
+  servicesEl.innerHTML = services.map((svc) => {
+    const checks = svc.checks.map((c) => `
+      <li>
+        <strong>${esc(c.label)}</strong> (${esc(c.url)})<br>
+        HTTP: ${c.status_code ?? 'n/a'} | Response time: ${c.latency_ms}ms<br>
+        Content: ${esc(c.content_type ?? 'n/a')}<br>
+        ${c.error ? `<span class="err">Error: ${esc(c.error)}</span>` : `<details><summary>Response body</summary><pre>${esc(JSON.stringify(c.body, null, 2))}</pre></details>`}
+      </li>
+    `).join('');
+
+    let extra = '';
+    if (svc.name === 'Ollama' && svc.extra) {
+      extra = `
+      <details>
+        <summary>Ollama model info</summary>
+        <pre>${esc(JSON.stringify(svc.extra, null, 2))}</pre>
+      </details>`;
+    }
+
+    return `
+      <article class="card ${svc.status}">
+        <details>
+          <summary>
+            <strong>${esc(svc.name)}</strong>
+            <span class="badge ${svc.status === 'up' ? 'badge-good' : 'badge-bad'}">${esc(friendlyStatus(svc.status))}</span>
+            <span class="header-meta">Port ${esc(svc.port ?? 'n/a')} • Uptime ${esc(formatUptime(svc.uptime_seconds))}</span>
+          </summary>
+          <p><button class="secondary restart-btn" data-service="${esc(svc.name)}">Restart ${esc(svc.name)}</button></p>
+          <p><strong>Address:</strong> ${esc(svc.base_url)}</p>
+          <p><strong>Up since:</strong> ${esc(formatDateEST(svc.up_since))}<br><strong>Last status change:</strong> ${esc(formatDateEST(svc.last_change))}</p>
+          <ul>${checks}</ul>
+          ${extra}
+        </details>
+      </article>
+    `;
+  }).join('');
+
+  document.querySelectorAll('.restart-btn').forEach((btn) => {
+    btn.addEventListener('click', () => restartService(btn.dataset.service));
+  });
+}
+
+function renderPorts(ports) {
+  portsEl.textContent = JSON.stringify(ports, null, 2);
+}
+
+function cleanCliText(text) {
+  const raw = String(text || '').replace(/\r\n/g, '\n');
+  const lines = raw.split('\n');
+  const filtered = [];
+  let prevBlank = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^=+$/.test(trimmed)) {
+      continue;
+    }
+    if (trimmed === '') {
+      if (!prevBlank) {
+        filtered.push('');
+      }
+      prevBlank = true;
+      continue;
+    }
+    prevBlank = false;
+    filtered.push(line);
+  }
+
+  return filtered.join('\n').trim();
+}
+
+function formatCommandResult(data) {
+  const statusLabel = data.ok ? 'OK' : 'FAILED';
+  const exitCode = data.exit_code == null ? 'n/a' : data.exit_code;
+  const cmd = data.command || 'venv_start';
+  const runAt = data.ran_at || 'n/a';
+  const stdout = cleanCliText(data.stdout || '');
+  const stderr = cleanCliText(data.stderr || '');
+
+  const chunks = [
+    `Command: ${cmd}`,
+    `Status: ${statusLabel} (exit ${exitCode})`,
+    `Ran at: ${runAt}`,
+  ];
+
+  if (stdout) {
+    chunks.push('', 'STDOUT', '------', stdout);
+  }
+  if (stderr) {
+    chunks.push('', 'STDERR', '------', stderr);
+  }
+
+  if (!stdout && !stderr) {
+    chunks.push('', 'No command output returned.');
+  }
+
+  return chunks.join('\n');
+}
+
+function formatServiceActionResult(data) {
+  const chunks = [
+    `Service: ${data.service || 'n/a'}`,
+    `Status: ${data.ok ? 'OK' : 'FAILED'}${data.exit_code == null ? '' : ` (exit ${data.exit_code})`}`,
+    `Latency: ${data.latency_ms ?? 'n/a'}ms`,
+    `Ran at: ${formatDateEST(data.ran_at)}`,
+  ];
+  if (data.stdout) {
+    chunks.push('', 'STDOUT', '------', cleanCliText(data.stdout));
+  }
+  if (data.stderr) {
+    chunks.push('', 'STDERR', '------', cleanCliText(data.stderr));
+  }
+  return chunks.join('\n');
+}
+
+function renderLocalwikiStatus(data) {
+  const totals = data.totals || {};
+  localwikiSummaryEl.innerHTML = `
+    <div class="stat"><strong>${totals.sources ?? 0}</strong><span>Sources</span></div>
+    <div class="stat good"><strong>${totals.loaded_completed ?? 0}</strong><span>Loaded</span></div>
+    <div class="stat"><strong>${totals.loaded_pending ?? 0}</strong><span>Pending</span></div>
+    <div class="stat bad"><strong>${totals.not_loaded ?? 0}</strong><span>Not loaded</span></div>
+  `;
+
+  const sources = data.sources || [];
+  localwikiSourcesEl.innerHTML = sources.map((src) => {
+    const loadedSample = (src.loaded || []).slice(0, 25).map((item) =>
+      `<li>${esc(item.display_uri || item.uri)} <span class="badge ${item.status === 'completed' ? 'badge-good' : 'badge-bad'}">${esc(item.status || 'unknown')}</span></li>`
+    ).join('');
+    const newFilesSample = (src.not_loaded || []).slice(0, 25).map((path) => `<li>${esc(path)}</li>`).join('');
+
+    return `
+      <article class="card">
+        <details>
+          <summary>
+            <strong>${esc(src.display_name || src.source_id)}</strong>
+            <span class="header-meta">${esc(src.source_type)} • loaded ${src.loaded_count} • not loaded ${src.not_loaded_count}</span>
+          </summary>
+          <p><strong>Root:</strong> ${esc(src.root_uri)}</p>
+          <p><strong>Added:</strong> ${esc(formatDateEST(src.added_at))}</p>
+          <details>
+            <summary>Loaded files (${src.loaded_count})</summary>
+            <ul>${loadedSample || '<li>None</li>'}</ul>
+            ${(src.loaded_count || 0) > 25 ? `<p class="help">Showing first 25 loaded files.</p>` : ''}
+          </details>
+          <details>
+            <summary>New files not loaded yet (${src.not_loaded_count})</summary>
+            <ul>${newFilesSample || '<li>None</li>'}</ul>
+            ${(src.not_loaded_count || 0) > 25 ? `<p class="help">Showing first 25 new files.</p>` : ''}
+          </details>
+        </details>
+      </article>
+    `;
+  }).join('');
+
+  const hasLocalwikiProblem = !data.venv_ready
+    || !data.db_exists
+    || (Array.isArray(data.errors) && data.errors.length > 0)
+    || Number(totals.loaded_other || 0) > 0
+    || Number(totals.not_loaded || 0) > 0;
+  setTabStatus(localwikiTabStatusEl, !hasLocalwikiProblem);
+}
+
+function pretty(v) {
+  if (v === null || v === undefined || v === '') return 'Not Set';
+  return String(v);
+}
+
+function renderFactsetStatus(data) {
+  const status = String(data.last_test_status || 'never_tested').toLowerCase();
+  const healthy = data.configured && status === 'success';
+  setTabStatus(factsetTabStatusEl, healthy);
+
+  factsetStatusGridEl.innerHTML = `
+    <div><strong>Configured</strong></div><div>${data.configured ? 'Yes' : 'No'}</div>
+    <div><strong>Auth Method</strong></div><div>OAuth 2.0 Client Credentials</div>
+    <div><strong>Config Source</strong></div><div>${esc(pretty(data.config_source))}</div>
+    <div><strong>Config Path</strong></div><div>${esc(pretty(data.config_path_display))}</div>
+    <div><strong>Uploaded Filename</strong></div><div>${esc(pretty(data.uploaded_filename))}</div>
+    <div><strong>Last Test</strong></div><div>${esc(pretty(data.last_test_status))}</div>
+    <div><strong>Token Status</strong></div><div>${esc(pretty(data.token_status))}</div>
+    <div><strong>Token Expires At</strong></div><div>${esc(pretty(data.token_expires_at))}</div>
+    <div><strong>Last Tested At</strong></div><div>${esc(pretty(data.last_tested_at))}</div>
+    <div><strong>Error Summary</strong></div><div>${esc(pretty(data.last_error_summary))}</div>
+  `;
+
+  if (data.config_path_display) {
+    factsetConfigPathEl.value = data.config_path_display;
+  }
+
+  factsetSdkTbodyEl.innerHTML = '';
+  const sdk = data.sdk || {};
+  Object.keys(sdk).forEach((name) => {
+    const item = sdk[name] || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(name)}</td><td>${item.installed ? 'Installed' : 'Missing'}</td><td>${esc(pretty(item.version))}</td>`;
+    factsetSdkTbodyEl.appendChild(tr);
+  });
+}
+
+async function refreshFactsetStatus() {
+  try {
+    const res = await fetch('/api/integrations/factset/status', { cache: 'no-store' });
+    const data = await res.json();
+    renderFactsetStatus(data);
+  } catch (err) {
+    factsetMessageEl.textContent = `Failed to load FactSet status: ${err}`;
+    setTabStatus(factsetTabStatusEl, false);
+  }
+}
+
+async function saveFactsetConfigPath() {
+  const config_path = (factsetConfigPathEl.value || '').trim();
+  const res = await fetch('/api/integrations/factset/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config_path })
+  });
+  const data = await res.json();
+  factsetMessageEl.textContent = data.message || (data.ok ? 'Saved' : 'Save failed');
+  await refreshFactsetStatus();
+}
+
+async function uploadFactsetConfig() {
+  if (!factsetConfigUploadEl.files || factsetConfigUploadEl.files.length === 0) {
+    factsetMessageEl.textContent = 'Choose a JSON file first.';
+    return;
+  }
+  const file = factsetConfigUploadEl.files[0];
+  const content = await file.text();
+  const res = await fetch('/api/integrations/factset/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, content })
+  });
+  const data = await res.json();
+  factsetMessageEl.textContent = data.message || (data.ok ? 'Uploaded' : 'Upload failed');
+  await refreshFactsetStatus();
+}
+
+async function testFactsetOauth() {
+  const res = await fetch('/api/integrations/factset/test', { method: 'POST' });
+  const data = await res.json();
+  factsetMessageEl.textContent = data.message || (data.ok ? 'Success' : 'Failed');
+  await refreshFactsetStatus();
+}
+
+async function clearFactsetConfig() {
+  const res = await fetch('/api/integrations/factset/clear', { method: 'POST' });
+  const data = await res.json();
+  factsetMessageEl.textContent = data.message || (data.ok ? 'Cleared' : 'Clear failed');
+  await refreshFactsetStatus();
+}
+
+async function refreshLocalwiki() {
+  try {
+    const res = await fetch('/api/localwiki/status', { cache: 'no-store' });
+    const data = await res.json();
+    renderLocalwikiStatus(data);
+  } catch (err) {
+    localwikiCommandEl.textContent = `Failed to load LocalWiki status: ${err}`;
+    setTabStatus(localwikiTabStatusEl, false);
+  }
+}
+
+async function runLocalwikiCommand(command) {
+  localwikiCommandEl.textContent = `Running command: ${command}...`;
+  const res = await fetch('/api/localwiki/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command })
+  });
+  const data = await res.json();
+  localwikiCommandEl.textContent = formatCommandResult(data);
+  await refreshLocalwiki();
+}
+
+async function startLocalwikiVenv() {
+  localwikiCommandEl.textContent = 'Starting LocalWiki venv and running status...';
+  const res = await fetch('/api/localwiki/venv/start', { method: 'POST' });
+  const data = await res.json();
+  localwikiCommandEl.textContent = formatCommandResult(data);
+  await refreshLocalwiki();
+}
+
+async function runSourcesUpdate() {
+  const path = (updatePathEl.value || '').trim();
+  const no_auto_ingest = Boolean(updateNoAutoEl.checked);
+  localwikiCommandEl.textContent = `Running sources update for: ${path || '(default path)'}...`;
+  const res = await fetch('/api/localwiki/sources/update', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, no_auto_ingest })
+  });
+  const data = await res.json();
+  localwikiCommandEl.textContent = formatCommandResult(data);
+  await refreshLocalwiki();
+}
+
+async function restartService(serviceName) {
+  serviceActionOutputEl.textContent = `Restarting ${serviceName}...`;
+  try {
+    const res = await fetch('/api/services/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ service: serviceName })
+    });
+    const data = await res.json();
+    serviceActionOutputEl.textContent = formatServiceActionResult(data);
+    await refresh();
+  } catch (err) {
+    serviceActionOutputEl.textContent = `Restart failed for ${serviceName}: ${err}`;
+  }
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    const data = await res.json();
+
+    const services = data.services || [];
+    renderOverall(services, data.generated_at);
+    renderServices(services);
+    renderPorts(data.ports || []);
+    rawEl.textContent = JSON.stringify(data, null, 2);
+    await refreshLocalwiki();
+    await refreshFactsetStatus();
+  } catch (err) {
+    overallEl.className = 'overall bad';
+    overallEl.querySelector('h2').textContent = 'Overall status: Unable to fetch data';
+    metaEl.textContent = `Error while loading dashboard: ${err}`;
+    setTabStatus(servicesTabStatusEl, false);
+  }
+}
+
+refreshBtn.addEventListener('click', refresh);
+venvStartBtn.addEventListener('click', startLocalwikiVenv);
+sourcesUpdateBtn.addEventListener('click', runSourcesUpdate);
+factsetSaveBtn.addEventListener('click', saveFactsetConfigPath);
+factsetUploadBtn.addEventListener('click', uploadFactsetConfig);
+factsetTestBtn.addEventListener('click', testFactsetOauth);
+factsetClearBtn.addEventListener('click', clearFactsetConfig);
+factsetRefreshBtn.addEventListener('click', refreshFactsetStatus);
+document.querySelectorAll('[data-cmd]').forEach((btn) => {
+  btn.addEventListener('click', () => runLocalwikiCommand(btn.dataset.cmd));
+});
+tabButtons.forEach((btn) => {
+  btn.addEventListener('click', () => activateTab(btn.dataset.tabTarget));
+});
+activateTab('servicesTab');
+refresh();
+setInterval(refresh, 60_000);
+</script>
+</body>
+</html>
