@@ -8,18 +8,18 @@ import sys
 import sqlite3
 import hashlib
 import time
-import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import logging
 import uuid
 import json
-import httpx
 import re
 from collections import Counter
 from src.parsers import ParserFactory
-from src.qdrant_utils import create_collection
+from src.embedding_service import EmbeddingService, build_embedding_text, resolve_embed_model
+from src.registry import RegistryService
+from src.vector_store_service import VectorStoreService
 
 
 EXTENSION_MIME_MAP = {
@@ -100,12 +100,19 @@ EMBEDDING_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DEFAULT_EMBED_BATCH_SIZE = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["embed_batch_size"]
-DEFAULT_QDRANT_BATCH_SIZE = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["qdrant_batch_size"]
-DEFAULT_CHUNK_TOKENS = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["chunk_tokens"]
-DEFAULT_CHUNK_OVERLAP = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["chunk_overlap"]
-DEFAULT_MAX_CHUNK_CHARS = EMBEDDING_MODEL_PROFILES["embeddinggemma:latest"]["max_chunk_chars"]
+DEFAULT_EMBED_BATCH_SIZE = EMBEDDING_MODEL_PROFILES["bge-m3:latest"]["embed_batch_size"]
+DEFAULT_QDRANT_BATCH_SIZE = EMBEDDING_MODEL_PROFILES["bge-m3:latest"]["qdrant_batch_size"]
+DEFAULT_CHUNK_TOKENS = EMBEDDING_MODEL_PROFILES["bge-m3:latest"]["chunk_tokens"]
+DEFAULT_CHUNK_OVERLAP = EMBEDDING_MODEL_PROFILES["bge-m3:latest"]["chunk_overlap"]
+DEFAULT_MAX_CHUNK_CHARS = EMBEDDING_MODEL_PROFILES["bge-m3:latest"]["max_chunk_chars"]
 EMBED_CONTEXT_FALLBACK_TOKENS = [600, 384, 300, 192, 128]
+
+_EMBEDDING_SERVICE = EmbeddingService(
+    default_embedder=DEFAULT_EMBEDDER,
+    default_chunk_tokens=DEFAULT_CHUNK_TOKENS,
+    default_max_chunk_chars=DEFAULT_MAX_CHUNK_CHARS,
+)
+_VECTOR_STORE_SERVICE = VectorStoreService()
 
 def _coalesce_positive_int(override: Optional[int], default_value: int) -> int:
     if isinstance(override, int) and override > 0:
@@ -355,6 +362,9 @@ class IngestionRegistry:
                 FOREIGN KEY (chunk_id) REFERENCES chunks (chunk_id)
             )
         ''')
+        cursor.execute(
+            "UPDATE vector_points SET status = 'confirmed' WHERE status = 'completed'"
+        )
         
         # Ingestion runs table
         cursor.execute('''
@@ -495,6 +505,128 @@ class IngestionRegistry:
         conn.commit()
         conn.close()
         logger.info(f"Added vector point: {point.point_id}")
+
+    def add_vector_points(self, points: List[VectorPoint]) -> None:
+        """Batch add vector points in a single transaction."""
+        if not points:
+            return
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.executemany(
+            '''
+            INSERT OR REPLACE INTO vector_points
+            (point_id, chunk_id, collection_name, alias_name, embedding_model, embedding_dim, vector_hash, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+            [
+                (
+                    point.point_id,
+                    point.chunk_id,
+                    point.collection_name,
+                    point.alias_name,
+                    point.embedding_model,
+                    point.embedding_dim,
+                    point.vector_hash,
+                    point.status,
+                )
+                for point in points
+            ],
+        )
+        conn.commit()
+        conn.close()
+        logger.info("Added %s vector points in batch", len(points))
+
+    def get_chunk_citations(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Batch load citation payloads for chunks."""
+        if not chunk_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        placeholders = ",".join(["?"] * len(unique_ids))
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT chunk_id, citation_json FROM chunks WHERE chunk_id IN ({placeholders})",
+            unique_ids,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        citations: Dict[str, Dict[str, Any]] = {}
+        for chunk_id, citation_json in rows:
+            chunk_text = ""
+            chunk_meta: Dict[str, Any] = {}
+            if citation_json:
+                try:
+                    payload = json.loads(citation_json) if citation_json.startswith("{") else {}
+                    chunk_text = payload.get("chunk_text", "")
+                    chunk_meta = payload.get("metadata", {})
+                except Exception:
+                    chunk_text = ""
+                    chunk_meta = {}
+            citations[chunk_id] = {"chunk_text": chunk_text, "metadata": chunk_meta}
+        return citations
+
+    def existing_vector_chunk_ids(
+        self,
+        chunk_ids: List[str],
+        collection_name: str,
+        statuses: Optional[List[str]] = None,
+    ) -> set:
+        """Return set of chunk IDs that already have points in collection."""
+        if not chunk_ids:
+            return set()
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        placeholders = ",".join(["?"] * len(unique_ids))
+        status_sql = ""
+        params: List[Any] = [collection_name] + unique_ids
+        if statuses:
+            status_placeholders = ",".join(["?"] * len(statuses))
+            status_sql = f" AND status IN ({status_placeholders})"
+            params.extend(statuses)
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT chunk_id FROM vector_points WHERE collection_name = ? AND chunk_id IN ({placeholders}){status_sql}",
+            params,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return {row[0] for row in rows}
+
+    def get_vector_points_for_chunks(self, chunk_ids: List[str], collection_name: str) -> Dict[str, List[VectorPoint]]:
+        """Return vector point records keyed by chunk ID for a collection."""
+        if not chunk_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        placeholders = ",".join(["?"] * len(unique_ids))
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT point_id, chunk_id, collection_name, alias_name, embedding_model, embedding_dim, vector_hash, status "
+            f"FROM vector_points WHERE collection_name = ? AND chunk_id IN ({placeholders})",
+            [collection_name] + unique_ids,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        by_chunk: Dict[str, List[VectorPoint]] = {}
+        for row in rows:
+            point = VectorPoint(*row)
+            by_chunk.setdefault(point.chunk_id, []).append(point)
+        return by_chunk
+
+    def update_vector_point_statuses(self, point_ids: List[str], status: str) -> None:
+        """Batch update vector point status."""
+        if not point_ids:
+            return
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.executemany(
+            "UPDATE vector_points SET status = ? WHERE point_id = ?",
+            [(status, point_id) for point_id in point_ids],
+        )
+        conn.commit()
+        conn.close()
 
     def vector_point_exists(self, chunk_id: str, collection_name: str) -> bool:
         """Check whether a chunk already has a vector in a collection."""
@@ -839,6 +971,50 @@ def _is_low_value_chunk(chunk_text: str, title: str = "") -> bool:
     return False
 
 
+def _run_ingestion_pipeline_impl(source_id: str, registry: IngestionRegistry,
+                                 qdrant_client, embedder: str, kb_name: str = "wiki_kb",
+                                 limit: int = 10000,
+                                 collection_name: Optional[str] = None,
+                                 changed_only: bool = False,
+                                 embed_batch_size: Optional[int] = None,
+                                 qdrant_batch_size: Optional[int] = None,
+                                 chunk_tokens: Optional[int] = None,
+                                 chunk_overlap: Optional[int] = None,
+                                 max_chunk_chars: Optional[int] = None) -> Dict[str, int]:
+    from src.ingestion_service import IngestionService
+
+    service = IngestionService(
+        logger=logger,
+        parser_factory=ParserFactory,
+        source_item_cls=SourceItem,
+        ingestion_run_cls=IngestionRun,
+        parser_error_cls=ParserError,
+        document_manager_cls=DocumentManager,
+        chunker_cls=Chunker,
+        chunk_cls=Chunk,
+        json_dumps_fn=json.dumps,
+        detect_source_type_and_mime=detect_source_type_and_mime,
+        resolve_model_ingestion_config=resolve_model_ingestion_config,
+        low_value_chunk_predicate=_is_low_value_chunk,
+        embed_chunks_and_store=embed_chunks_and_store,
+    )
+    return service.run(
+        source_id=source_id,
+        registry=registry,
+        qdrant_client=qdrant_client,
+        embedder=embedder,
+        kb_name=kb_name,
+        limit=limit,
+        collection_name=collection_name,
+        changed_only=changed_only,
+        embed_batch_size=embed_batch_size,
+        qdrant_batch_size=qdrant_batch_size,
+        chunk_tokens=chunk_tokens,
+        chunk_overlap=chunk_overlap,
+        max_chunk_chars=max_chunk_chars,
+    )
+
+
 def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                           qdrant_client, embedder: str, kb_name: str = "wiki_kb",
                           limit: int = 10000,
@@ -849,408 +1025,30 @@ def run_ingestion_pipeline(source_id: str, registry: IngestionRegistry,
                           chunk_tokens: Optional[int] = None,
                           chunk_overlap: Optional[int] = None,
                           max_chunk_chars: Optional[int] = None) -> Dict[str, int]:
-    """
-    Run the full ingestion pipeline for a source.
-    """
-    logger.info(f"Starting ingestion pipeline for source: {source_id}")
-    run_started_at = time.time()
-    ingestion_config = resolve_model_ingestion_config(
+    return _run_ingestion_pipeline_impl(
+        source_id=source_id,
+        registry=registry,
+        qdrant_client=qdrant_client,
         embedder=embedder,
+        kb_name=kb_name,
+        limit=limit,
+        collection_name=collection_name,
+        changed_only=changed_only,
         embed_batch_size=embed_batch_size,
         qdrant_batch_size=qdrant_batch_size,
         chunk_tokens=chunk_tokens,
         chunk_overlap=chunk_overlap,
         max_chunk_chars=max_chunk_chars,
     )
-    model_name = ingestion_config["model_name"]
-    effective_embed_batch_size = ingestion_config["embed_batch_size"]
-    effective_qdrant_batch_size = ingestion_config["qdrant_batch_size"]
-    effective_chunk_tokens = ingestion_config["chunk_tokens"]
-    effective_chunk_overlap = ingestion_config["chunk_overlap"]
-    effective_max_chunk_chars = ingestion_config["max_chunk_chars"]
-
-    effective_limit = limit if (limit and limit > 0) else None
-    print(f"[Ingestion Start] source={source_id} model={model_name} kb={kb_name}")
-    print(
-        "[Ingestion Config] "
-        f"chunk_tokens={effective_chunk_tokens} "
-        f"chunk_overlap={effective_chunk_overlap} "
-        f"embed_batch_size={effective_embed_batch_size} "
-        f"qdrant_batch_size={effective_qdrant_batch_size} "
-        f"max_chunk_chars={effective_max_chunk_chars} "
-        f"changed_only={changed_only} "
-        f"limit={effective_limit if effective_limit is not None else 'unlimited'} "
-        f"collection_override={collection_name or 'auto'}"
-    )
-    stats: Dict[str, int] = {
-        "documents_discovered": 0,
-        "documents_parsed": 0,
-        "chunks_prepared": 0,
-        "chunks_created": 0,
-        "chunks_embedded": 0,
-        "points_stored": 0,
-        "elapsed_seconds": 0,
-        "avg_chunks_per_sec": 0,
-        "status": "running",
-    }
-    
-    # Start new ingestion run
-    
-    
-    run_id = f"run_{uuid.uuid4().hex}"
-    source = registry.get_source(source_id)
-    
-    if not source:
-        logger.error(f"Source {source_id} not found")
-        return stats
-        
-    run = IngestionRun(
-        ingest_run_id=run_id,
-        source_id=source_id,
-        started_at=str(int(time.time())),
-        status="running"
-    )
-    registry.add_ingestion_run(run)
-    
-    had_item_errors = False
-    processed_items = 0
-    failed_items = 0
-
-    try:
-        discovery_seen = 0
-        discovery_registered = 0
-        discovery_skipped_unchanged = 0
-        discovered_item_ids = set()
-
-        # Discover source files and register them before processing
-        if source.source_type == "folder":
-            for file_path in Path(source.root_uri).rglob("*"):
-                if not file_path.is_file():
-                    continue
-
-                discovery_seen += 1
-
-                stat = file_path.stat()
-                _, mime_type = detect_source_type_and_mime(file_path)
-                item_id = f"item_{hashlib.md5(str(file_path).encode('utf-8')).hexdigest()}"
-                discovered_item_ids.add(item_id)
-                mtime = str(int(stat.st_mtime))
-                existing = registry.get_source_item(item_id)
-                if (
-                    changed_only
-                    and existing
-                    and existing.status == "completed"
-                    and existing.size_bytes == stat.st_size
-                    and existing.mtime == mtime
-                ):
-                    discovery_skipped_unchanged += 1
-                    continue
-                source_item = SourceItem(
-                    source_item_id=item_id,
-                    source_id=source.source_id,
-                    uri=str(file_path),
-                    display_uri=str(file_path.relative_to(source.root_uri)),
-                    mime_type=mime_type,
-                    size_bytes=stat.st_size,
-                    mtime=mtime,
-                    content_hash=f"{stat.st_size}:{mtime}",
-                    status="pending"
-                )
-                registry.add_source_item(source_item)
-                discovery_registered += 1
-        elif source.source_type in {"zim", "wikidump", "file", "text", "pdf"}:
-            source_file = Path(source.root_uri)
-            if source_file.exists() and source_file.is_file():
-                discovery_seen += 1
-                stat = source_file.stat()
-                _, mime_type = detect_source_type_and_mime(source_file)
-                item_id = f"item_{hashlib.md5(str(source_file).encode('utf-8')).hexdigest()}"
-                discovered_item_ids.add(item_id)
-                mtime = str(int(stat.st_mtime))
-                existing = registry.get_source_item(item_id)
-                if (
-                    changed_only
-                    and existing
-                    and existing.status == "completed"
-                    and existing.size_bytes == stat.st_size
-                    and existing.mtime == mtime
-                ):
-                    discovery_skipped_unchanged += 1
-                    logger.info("Skipping unchanged source item: %s", source_file)
-                else:
-                    source_item = SourceItem(
-                        source_item_id=item_id,
-                        source_id=source.source_id,
-                        uri=str(source_file),
-                        display_uri=source_file.name,
-                        mime_type=mime_type,
-                        size_bytes=stat.st_size,
-                        mtime=mtime,
-                        content_hash=f"{stat.st_size}:{mtime}",
-                        status="pending",
-                    )
-                    registry.add_source_item(source_item)
-                    discovery_registered += 1
-            else:
-                logger.error(f"Source file not found: {source.root_uri}")
-
-        logger.info(
-            "Discovery summary for source=%s: seen=%s registered=%s skipped_unchanged=%s changed_only=%s",
-            source_id,
-            discovery_seen,
-            discovery_registered,
-            discovery_skipped_unchanged,
-            changed_only,
-        )
-
-        # Get source items to process
-        items = registry.get_unprocessed_items(source_id)
-        if changed_only:
-            before_filter = len(items)
-            items = [item for item in items if item.source_item_id in discovered_item_ids]
-            logger.info(
-                "Changed-only queue filter applied: before=%s after=%s filtered_out=%s",
-                before_filter,
-                len(items),
-                before_filter - len(items),
-            )
-        status_counts = Counter(item.status for item in items)
-        logger.info(
-            "Queued items for processing: total=%s status_breakdown=%s",
-            len(items),
-            dict(status_counts),
-        )
-        
-        # Process each item
-        for item in items:
-            try:
-                parser = None
-                logger.info(f"Processing item: {item.uri}")
-                chunks_before_item = stats["chunks_created"]
-                chunks_prepared_before_item = stats["chunks_prepared"]
-                embedded_before_item = stats["chunks_embedded"]
-                vectors_before_item = stats["points_stored"]
-                
-                parser = ParserFactory.create_parser_for_item(item)
-                parsed_docs = parser.parse_documents(item)
-                logger.info(
-                    "Parser output for item=%s parser=%s docs=%s",
-                    item.source_item_id,
-                    getattr(parser, "parser_name", "unknown"),
-                    len(parsed_docs),
-                )
-                if effective_limit is not None:
-                    remaining = effective_limit - stats["documents_discovered"]
-                    if remaining <= 0:
-                        break
-                    parsed_docs = parsed_docs[:remaining]
-                stats["documents_discovered"] += len(parsed_docs)
-                doc_manager = DocumentManager(registry)
-                parser_name = getattr(parser, "parser_name", "text")
-
-                item_docs_empty = 0
-                item_docs_low_value = 0
-                item_chunks_raw = 0
-                item_chunks_truncated = 0
-                item_chunks_low_value = 0
-
-                for parsed_doc in parsed_docs:
-                    text = parsed_doc.get("text", "")
-                    if not text.strip():
-                        item_docs_empty += 1
-                        continue
-                    metadata = parsed_doc.get("metadata", {})
-                    title = parsed_doc.get("title") or Path(item.uri).name
-                    if _is_low_value_chunk(text, title=title):
-                        item_docs_low_value += 1
-                        continue
-                    source_uri = parsed_doc.get("source_uri") or item.uri
-                    source_type = parsed_doc.get("source_type") or metadata.get("source_type") or source.source_type or "text"
-                    display_uri = metadata.get("display_uri") or item.display_uri or Path(item.uri).name
-                    doc_key = f"{source_uri}:{title}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
-
-                    stats["documents_parsed"] += 1
-
-                    document = doc_manager.create_document(
-                        item,
-                        text,
-                        parser_name,
-                        metadata,
-                        title=title,
-                        doc_key=doc_key,
-                    )
-
-                    chunker = Chunker(max_tokens=effective_chunk_tokens, overlap_tokens=effective_chunk_overlap, min_tokens=300)
-                    chunks_list = chunker.chunk_text(text, "", metadata)
-                    item_chunks_raw += len(chunks_list)
-
-                    chunked_data = []
-                    for chunk_data in chunks_list:
-                        if len(chunk_data["chunk_text"]) > effective_max_chunk_chars:
-                            chunk_data["chunk_text"] = chunk_data["chunk_text"][:effective_max_chunk_chars]
-                            item_chunks_truncated += 1
-                        if _is_low_value_chunk(chunk_data["chunk_text"], title=title):
-                            item_chunks_low_value += 1
-                            continue
-                    # Create chunk and register it
-                        chunk_id = f"chunk_{hashlib.md5((document.doc_id + ':' + str(chunk_data['chunk_index']) + ':' + chunk_data['chunk_text']).encode('utf-8')).hexdigest()}"
-                        chunk = Chunk(
-                            chunk_id=chunk_id,
-                            doc_id=document.doc_id,
-                            chunk_index=chunk_data['chunk_index'],
-                            section=chunk_data['section'],
-                            char_start=chunk_data['char_start'],
-                            char_end=chunk_data['char_end'],
-                            token_estimate=chunk_data['token_estimate'],
-                            text_hash=doc_manager.generate_hash(chunk_data['chunk_text']),
-                            citation_json=json.dumps({
-                                "metadata": {
-                                    **(chunk_data.get('metadata') or {}),
-                                    "title": title,
-                                    "source_uri": source_uri,
-                                    "source_type": source_type,
-                                    "display_uri": display_uri,
-                                },
-                                "chunk_text": chunk_data['chunk_text']
-                            })
-                        )
-                        
-                        registry.add_chunk(chunk)
-                        chunked_data.append(chunk)
-                    stats["chunks_prepared"] += len(chunked_data)
-
-                    embed_stats = embed_chunks_and_store(
-                        qdrant_client,
-                        chunked_data,
-                        embedder,
-                        document,
-                        registry,
-                        item,
-                        source,
-                        kb_name,
-                        collection_name=collection_name,
-                        embed_batch_size=effective_embed_batch_size,
-                        qdrant_batch_size=effective_qdrant_batch_size,
-                        embed_max_tokens=effective_chunk_tokens,
-                        max_chunk_chars=effective_max_chunk_chars,
-                    )
-                    stats["chunks_created"] += embed_stats["chunks_embedded"]
-                    stats["chunks_embedded"] += embed_stats["chunks_embedded"]
-                    stats["points_stored"] += embed_stats["points_stored"]
-
-                if effective_limit is not None and stats["documents_discovered"] >= effective_limit:
-                    logger.info("Reached ingest limit (%s documents discovered)", effective_limit)
-                    break
-
-                registry.update_source_item_status(item.source_item_id, "completed")
-                processed_items += 1
-                elapsed = max(0.001, time.time() - run_started_at)
-                chunks_per_sec = stats["chunks_created"] / elapsed
-                item_chunks = stats["chunks_created"] - chunks_before_item
-                item_chunks_prepared = stats["chunks_prepared"] - chunks_prepared_before_item
-                item_embedded = stats["chunks_embedded"] - embedded_before_item
-                item_vectors = stats["points_stored"] - vectors_before_item
-                logger.info(
-                    "Item summary id=%s docs_discovered=%s docs_empty=%s docs_low_value=%s chunks_raw=%s chunks_truncated=%s chunks_low_value=%s chunks_prepared=%s chunks_created=%s chunks_embedded=%s vectors_written=%s",
-                    item.source_item_id,
-                    len(parsed_docs),
-                    item_docs_empty,
-                    item_docs_low_value,
-                    item_chunks_raw,
-                    item_chunks_truncated,
-                    item_chunks_low_value,
-                    item_chunks_prepared,
-                    item_chunks,
-                    item_embedded,
-                    item_vectors,
-                )
-                print(
-                    "[Ingestion Progress] "
-                    f"docs={stats['documents_parsed']} "
-                    f"chunks_prepared={stats['chunks_prepared']} "
-                    f"chunks_created={stats['chunks_created']} "
-                    f"embedded={stats['chunks_embedded']} "
-                    f"vectors={stats['points_stored']} "
-                    f"item_chunks_prepared={item_chunks_prepared} "
-                    f"item_chunks_created={item_chunks} "
-                    f"chunks/s={chunks_per_sec:.2f}"
-                )
-                
-            except Exception as e:
-                logger.error(f"Error processing item {item.uri}: {str(e)}")
-                had_item_errors = True
-                failed_items += 1
-                registry.update_source_item_status(item.source_item_id, "failed")
-                # Record parser error
-                error = ParserError(
-                    error_id=f"err_{uuid.uuid4().hex}",
-                    ingest_run_id=run_id,
-                    source_item_id=item.source_item_id,
-                    parser=getattr(locals().get("parser"), "parser_name", "unknown"),
-                    error_type="ProcessingError",
-                    message=str(e),
-                    traceback=traceback.format_exc(),
-                    created_at=str(int(time.time()))
-                )
-                registry.add_parser_error(error)
-                
-        if had_item_errors:
-            registry.update_ingestion_run_status(run_id, "failed", str(int(time.time())))
-            raise RuntimeError(
-                f"Ingestion failed for source {source_id}: processed={processed_items}, failed={failed_items}"
-            )
-
-        # Mark ingestion run as complete
-        registry.update_ingestion_run_status(run_id, "completed", str(int(time.time())))
-        logger.info(f"Ingestion pipeline complete for source: {source_id}")
-        elapsed = max(0.001, time.time() - run_started_at)
-        stats["elapsed_seconds"] = int(elapsed)
-        stats["avg_chunks_per_sec"] = round(stats["chunks_created"] / elapsed, 2)
-        stats["status"] = "completed"
-        print(
-            "[Ingestion Complete] "
-            f"source={source_id} model={model_name} "
-            f"chunks_prepared={stats['chunks_prepared']} "
-            f"chunks_created={stats['chunks_created']} "
-            f"chunks/s={stats['avg_chunks_per_sec']:.2f}"
-        )
-        return stats
-        
-    except Exception as e:
-        logger.error(f"Error in ingestion pipeline: {str(e)}")
-        registry.update_ingestion_run_status(run_id, "failed", str(int(time.time())))
-        elapsed = max(0.001, time.time() - run_started_at)
-        stats["elapsed_seconds"] = int(elapsed)
-        stats["avg_chunks_per_sec"] = round(stats["chunks_created"] / elapsed, 2)
-        stats["status"] = "failed"
-        return stats
 
 def _resolve_embed_model(embedder: Optional[str]) -> str:
-    if embedder and embedder.startswith("ollama:"):
-        return embedder.split(":", 1)[1]
-    model = embedder or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBEDDER)
-    if ":" not in model:
-        return f"{model}:latest"
-    return model
+    return resolve_embed_model(embedder, DEFAULT_EMBEDDER)
 
 
 def _truncate_text_for_embedding(text: str, max_tokens: int, max_chars: int) -> Tuple[str, bool]:
-    candidate = (text or "").strip()
-    if not candidate:
-        return "", False
+    from src.embedding_service import truncate_text_for_embedding
 
-    token_matches = list(re.finditer(r"\S+", candidate))
-    truncated = False
-    if max_tokens > 0 and len(token_matches) > max_tokens:
-        end_char = token_matches[max_tokens - 1].end()
-        candidate = candidate[:end_char].strip()
-        truncated = True
-
-    if max_chars > 0 and len(candidate) > max_chars:
-        candidate = candidate[:max_chars].strip()
-        truncated = True
-
-    return candidate, truncated
+    return truncate_text_for_embedding(text, max_tokens, max_chars)
 
 
 def _collection_name_for(kb_name: str, model_name: str, collection_name: Optional[str] = None) -> str:
@@ -1270,6 +1068,11 @@ def resolve_collection_name(embedder: str, collection_name: Optional[str] = None
 
 
 def infer_embedding_dimension(embedder: str, ollama_url: Optional[str] = None) -> int:
+    try:
+        import httpx
+    except Exception as exc:
+        raise RuntimeError("Dimension inference requires httpx. Install with: pip install httpx") from exc
+
     model_name = _resolve_embed_model(embedder or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBEDDER))
     url = (ollama_url or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/") + "/api/embed"
     with httpx.Client(timeout=60.0) as client:
@@ -1308,21 +1111,13 @@ def _recommended_collection_name(model_name: str, vector_dim: int) -> str:
 
 
 def _ensure_collection_compatible(qdrant_client, collection_name: str, model_name: str, vector_dim: int) -> None:
-    collections = qdrant_client.get_collections()
-    existing_names = {col.name for col in collections.collections}
-    if collection_name not in existing_names:
-        create_collection(qdrant_client, collection_name=collection_name, vector_dim=vector_dim)
-        logger.info("Created collection %s with vector dim %s", collection_name, vector_dim)
-        return
-
-    info = qdrant_client.get_collection(collection_name)
-    existing_dim = _extract_collection_vector_dim(info)
-    if existing_dim is not None and existing_dim != vector_dim:
-        recommended = _recommended_collection_name(model_name, vector_dim)
-        raise RuntimeError(
-            f"Collection {collection_name} has dim {existing_dim} but embedder {model_name} returned dim {vector_dim}. "
-            f"Use a separate collection (e.g. {recommended}) or recreate the collection."
-        )
+    _VECTOR_STORE_SERVICE.ensure_collection_compatible(
+        qdrant_client,
+        collection_name=collection_name,
+        model_name=model_name,
+        vector_dim=vector_dim,
+        logger=logger,
+    )
 
 
 def _prepare_embed_items(
@@ -1330,22 +1125,9 @@ def _prepare_embed_items(
     max_tokens: int,
     max_chars: int,
 ) -> Tuple[List[str], List[int], int, int]:
-    prepared_texts: List[str] = []
-    kept_indices: List[int] = []
-    truncated_count = 0
-    dropped_count = 0
+    from src.embedding_service import prepare_embed_items
 
-    for idx, text in enumerate(texts):
-        prepared, truncated = _truncate_text_for_embedding(text, max_tokens=max_tokens, max_chars=max_chars)
-        if not prepared:
-            dropped_count += 1
-            continue
-        prepared_texts.append(prepared)
-        kept_indices.append(idx)
-        if truncated:
-            truncated_count += 1
-
-    return prepared_texts, kept_indices, truncated_count, dropped_count
+    return prepare_embed_items(texts, max_tokens=max_tokens, max_chars=max_chars)
 
 
 def _embed_texts(
@@ -1356,123 +1138,15 @@ def _embed_texts(
     max_tokens: Optional[int] = None,
     max_chars: Optional[int] = None,
 ) -> Tuple[List[List[float]], List[int]]:
-    if not texts:
-        return [], []
-
-    url = ollama_url.rstrip("/") + "/api/embed"
-    batch_size = max(1, batch_size)
-    configured_max_tokens = int(os.getenv("LOCALWIKI_EMBED_MAX_TOKENS", "0"))
-    default_max_tokens = _coalesce_positive_int(max_tokens, DEFAULT_CHUNK_TOKENS)
-    initial_max_tokens = configured_max_tokens if configured_max_tokens > 0 else default_max_tokens
-    configured_max_chars = int(os.getenv("LOCALWIKI_EMBED_MAX_CHARS", "0"))
-    initial_max_chars = configured_max_chars if configured_max_chars > 0 else _coalesce_positive_int(max_chars, DEFAULT_MAX_CHUNK_CHARS)
-    token_caps = _token_caps_for_retry(initial_max_tokens)
-    timeout_seconds = float(os.getenv("LOCALWIKI_EMBED_TIMEOUT_SECONDS", "600"))
-
-    all_embeddings: List[List[float]] = []
-    all_kept_indices: List[int] = []
-
-    with httpx.Client(timeout=timeout_seconds) as client:
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            batch_global_indices = list(range(i, i + len(batch_texts)))
-            batch_index = (i // batch_size) + 1
-            last_error = ""
-            attempted_caps: List[int] = []
-            succeeded = False
-
-            for cap in token_caps:
-                attempted_caps.append(cap)
-                cap_chars = max(256, int(initial_max_chars * (cap / max(1, initial_max_tokens))))
-                prepared_texts, kept_local_indices, truncated_count, dropped_count = _prepare_embed_items(
-                    batch_texts,
-                    max_tokens=cap,
-                    max_chars=cap_chars,
-                )
-                if not prepared_texts:
-                    logger.warning(
-                        "Embedding batch %s dropped entirely after preprocessing (model=%s cap_tokens=%s cap_chars=%s)",
-                        batch_index,
-                        model_name,
-                        cap,
-                        cap_chars,
-                    )
-                    succeeded = True
-                    break
-
-                prepared_char_lengths = [len(t) for t in prepared_texts]
-                prepared_token_lengths = [_estimate_token_count(t) for t in prepared_texts]
-                if truncated_count or dropped_count:
-                    logger.info(
-                        "Embedding batch %s preprocessing: truncated=%s dropped=%s kept=%s (model=%s cap_tokens=%s cap_chars=%s)",
-                        batch_index,
-                        truncated_count,
-                        dropped_count,
-                        len(prepared_texts),
-                        model_name,
-                        cap,
-                        cap_chars,
-                    )
-                logger.info(
-                    "Embedding batch %s: size=%s chars_total=%s chars[min=%s max=%s] est_tokens_total=%s est_tokens[min=%s max=%s] cap_tokens=%s cap_chars=%s",
-                    batch_index,
-                    len(prepared_texts),
-                    sum(prepared_char_lengths),
-                    min(prepared_char_lengths),
-                    max(prepared_char_lengths),
-                    sum(prepared_token_lengths),
-                    min(prepared_token_lengths),
-                    max(prepared_token_lengths),
-                    cap,
-                    cap_chars,
-                )
-
-                payload = {"model": model_name, "input": prepared_texts}
-                response = client.post(url, json=payload)
-                if response.status_code >= 400:
-                    detail = (response.text or "").strip()
-                    if len(detail) > 500:
-                        detail = detail[:500] + "..."
-                    last_error = detail
-                    if response.status_code == 400 and _is_context_length_error(detail) and cap != token_caps[-1]:
-                        next_cap = token_caps[token_caps.index(cap) + 1]
-                        logger.warning(
-                            "Embedding batch %s hit context limit at cap_tokens=%s; retrying with cap_tokens=%s",
-                            batch_index,
-                            cap,
-                            next_cap,
-                        )
-                        continue
-                    if response.status_code == 400 and _is_context_length_error(detail):
-                        break
-                    raise RuntimeError(
-                        "Ollama embedding request failed "
-                        f"(status={response.status_code}, model={model_name}, batch={len(prepared_texts)}, "
-                        f"cap_tokens={cap}, cap_chars={cap_chars}): {detail}"
-                    )
-
-                data = response.json()
-                embeddings = data.get("embeddings") or []
-                if len(embeddings) != len(prepared_texts):
-                    raise RuntimeError(
-                        f"Embedding count mismatch from Ollama: expected {len(prepared_texts)} got {len(embeddings)}"
-                    )
-
-                all_embeddings.extend(embeddings)
-                all_kept_indices.extend([batch_global_indices[idx] for idx in kept_local_indices])
-                succeeded = True
-                break
-
-            if not succeeded:
-                raise RuntimeError(
-                    "Ollama embedding request failed after context retries "
-                    f"(model={model_name}, attempted_token_caps={attempted_caps}): {last_error}"
-                )
-
-    if len(all_embeddings) != len(all_kept_indices):
-        raise RuntimeError("Embedding alignment mismatch between vectors and source chunks")
-
-    return all_embeddings, all_kept_indices
+    return _EMBEDDING_SERVICE.embed_texts(
+        texts=texts,
+        model_name=model_name,
+        ollama_url=ollama_url,
+        batch_size=batch_size,
+        max_tokens=max_tokens,
+        max_chars=max_chars,
+        logger=logger,
+    )
 
 
 def _build_embedding_text(
@@ -1482,20 +1156,7 @@ def _build_embedding_text(
     source_item: SourceItem,
     source: Source,
 ) -> str:
-    title = (chunk_meta.get("title") or document.title or "").strip()
-    source_uri = (chunk_meta.get("source_uri") or source_item.uri or "").strip()
-    source_type = (chunk_meta.get("source_type") or source.source_type or "text").strip()
-    display_uri = (chunk_meta.get("display_uri") or source_item.display_uri or "").strip()
-
-    context_lines = [
-        f"Title: {title}" if title else "",
-        f"Source: {display_uri or source_uri}" if (display_uri or source_uri) else "",
-        f"Source Type: {source_type}" if source_type else "",
-    ]
-    context = "\n".join(line for line in context_lines if line)
-    if not context:
-        return chunk_text
-    return f"{context}\n\n{chunk_text}".strip()
+    return build_embedding_text(chunk_text, chunk_meta, document, source_item, source)
 
 
 def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
@@ -1517,39 +1178,62 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
     ollama_url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
     resolved_collection_name = _collection_name_for(kb_name, model_name, collection_name)
     precheck_collection_name = resolved_collection_name or collection_name
+    registry_service = RegistryService(registry)
+
+    chunk_ids = [chunk.chunk_id for chunk in chunks]
+    citation_map = registry_service.get_chunk_citations(chunk_ids)
+    existing_chunk_ids = set()
+    if precheck_collection_name:
+        existing_chunk_ids = registry_service.existing_vector_chunk_ids_by_status(
+            chunk_ids,
+            precheck_collection_name,
+            statuses=["confirmed"],
+        )
+        vector_points_by_chunk = registry_service.get_vector_points_for_chunks(chunk_ids, precheck_collection_name)
+        point_to_chunk: Dict[str, str] = {}
+        unresolved_point_ids: List[str] = []
+        for chunk_id, records in vector_points_by_chunk.items():
+            if chunk_id in existing_chunk_ids:
+                continue
+            for record in records:
+                if record.status in {"pending", "upserted_remote"}:
+                    unresolved_point_ids.append(record.point_id)
+                    point_to_chunk[record.point_id] = chunk_id
+
+        if unresolved_point_ids:
+            remote_existing_ids = _VECTOR_STORE_SERVICE.fetch_existing_point_ids(
+                qdrant_client,
+                collection_name=precheck_collection_name,
+                point_ids=unresolved_point_ids,
+            )
+            confirmed_now = [point_id for point_id in unresolved_point_ids if point_id in remote_existing_ids]
+            if confirmed_now:
+                registry_service.update_vector_point_statuses(confirmed_now, "confirmed")
+                existing_chunk_ids.update(point_to_chunk[point_id] for point_id in confirmed_now)
 
     prepared_items: List[Dict[str, Any]] = []
     precheck_skipped_existing = 0
     skipped_missing_text = 0
     for chunk in chunks:
-        existing = registry.get_chunk_by_text_hash(chunk.text_hash)
-        if existing and precheck_collection_name and registry.vector_point_exists(chunk.chunk_id, precheck_collection_name):
-                precheck_skipped_existing += 1
-                continue
-        conn = sqlite3.connect(registry.db_path)
-        cur = conn.cursor()
-        cur.execute("SELECT citation_json FROM chunks WHERE chunk_id = ?", (chunk.chunk_id,))
-        row = cur.fetchone()
-        conn.close()
-        chunk_text = ""
-        chunk_meta = {}
-        if row and row[0]:
-            try:
-                meta = json.loads(row[0]) if row[0].startswith("{") else {}
-                chunk_text = meta.get("chunk_text", "")
-                chunk_meta = meta.get("metadata", {})
-            except Exception:
-                chunk_text = ""
+        if precheck_collection_name and chunk.chunk_id in existing_chunk_ids:
+            precheck_skipped_existing += 1
+            continue
+
+        citation = citation_map.get(chunk.chunk_id, {})
+        chunk_text = citation.get("chunk_text", "") if citation else ""
+        chunk_meta = citation.get("metadata", {}) if citation else {}
         if not chunk_text:
             skipped_missing_text += 1
             continue
         embed_text = _build_embedding_text(chunk_text, chunk_meta, document, source_item, source)
-        prepared_items.append({
-            "chunk": chunk,
-            "embed_text": embed_text,
-            "chunk_text": chunk_text,
-            "chunk_meta": chunk_meta,
-        })
+        prepared_items.append(
+            {
+                "chunk": chunk,
+                "embed_text": embed_text,
+                "chunk_text": chunk_text,
+                "chunk_meta": chunk_meta,
+            }
+        )
 
     logger.info(
         "Embed prep summary doc=%s source_item=%s input_chunks=%s precheck_skipped=%s missing_text=%s prepared=%s precheck_collection=%s",
@@ -1586,12 +1270,36 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
     collection_name = resolved_collection_name or collection_name_for_dimension(vector_dim)
     _ensure_collection_compatible(qdrant_client, collection_name, model_name, vector_dim)
 
+    embedded_chunk_ids = [item["chunk"].chunk_id for item in embedded_items]
+    vector_points_by_chunk = registry_service.get_vector_points_for_chunks(embedded_chunk_ids, collection_name)
+    unresolved_point_ids: List[str] = []
+    for _, records in vector_points_by_chunk.items():
+        for record in records:
+            if record.status in {"pending", "upserted_remote"}:
+                unresolved_point_ids.append(record.point_id)
+
+    if unresolved_point_ids:
+        remote_existing_ids = _VECTOR_STORE_SERVICE.fetch_existing_point_ids(
+            qdrant_client,
+            collection_name=collection_name,
+            point_ids=unresolved_point_ids,
+        )
+        confirmed_now = [point_id for point_id in unresolved_point_ids if point_id in remote_existing_ids]
+        if confirmed_now:
+            registry_service.update_vector_point_statuses(confirmed_now, "confirmed")
+
+    already_written_chunk_ids = registry_service.existing_vector_chunk_ids_by_status(
+        embedded_chunk_ids,
+        collection_name,
+        statuses=["confirmed"],
+    )
+
     filtered_items: List[Dict[str, Any]] = []
     filtered_embeddings: List[List[float]] = []
     postcheck_skipped_existing = 0
     for item, vector in zip(embedded_items, embeddings):
         chunk = item["chunk"]
-        if registry.vector_point_exists(chunk.chunk_id, collection_name):
+        if chunk.chunk_id in already_written_chunk_ids:
             postcheck_skipped_existing += 1
             continue
         filtered_items.append(item)
@@ -1653,17 +1361,20 @@ def embed_chunks_and_store(qdrant_client, chunks: List[Chunk], embedder: str,
             embedding_model=model_name,
             embedding_dim=len(vector),
             vector_hash=content_hash,
-            status="completed"
+            status="pending"
         ))
 
     write_batch_size = max(1, qdrant_batch_size)
-    points_written = 0
-    for i in range(0, len(points), write_batch_size):
-        batch = points[i:i+write_batch_size]
-        qdrant_client.upsert(collection_name=collection_name, points=batch)
-        for record in point_records[i:i+write_batch_size]:
-            registry.add_vector_point(record)
-        points_written += len(batch)
+    registry_service.add_vector_points(point_records)
+    points_written = _VECTOR_STORE_SERVICE.upsert_points(
+        qdrant_client,
+        collection_name=collection_name,
+        points=points,
+        batch_size=write_batch_size,
+    )
+    point_ids = [record.point_id for record in point_records]
+    registry_service.update_vector_point_statuses(point_ids, "upserted_remote")
+    registry_service.update_vector_point_statuses(point_ids, "confirmed")
 
     stats["chunks_embedded"] = len(embedded_items)
     stats["points_stored"] = points_written

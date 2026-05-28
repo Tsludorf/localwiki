@@ -18,6 +18,10 @@ from core import (
     SourceItem,
     BaseParser,
     CanonicalDocument,
+    VectorPoint,
+    DEFAULT_EMBEDDER,
+    DEFAULT_CHUNK_TOKENS,
+    DEFAULT_CHUNK_OVERLAP,
     detect_source_type_and_mime,
     _build_embedding_text,
     resolve_collection_name,
@@ -145,6 +149,14 @@ def test_resolve_model_ingestion_config_profile_and_overrides():
     assert override_cfg["embed_batch_size"] == 16
     assert override_cfg["qdrant_batch_size"] == 64
     assert override_cfg["max_chunk_chars"] == 1024
+
+
+def test_default_profile_alignment_is_bge_m3():
+    cfg = resolve_model_ingestion_config(embedder=DEFAULT_EMBEDDER)
+    assert DEFAULT_EMBEDDER == "bge-m3:latest"
+    assert cfg["dimensions"] == 1024
+    assert cfg["chunk_tokens"] == DEFAULT_CHUNK_TOKENS
+    assert cfg["chunk_overlap"] == DEFAULT_CHUNK_OVERLAP
 
 def test_registry_initialization():
     """Test that the registry initializes correctly."""
@@ -285,6 +297,55 @@ def test_parser():
         
     finally:
         # Clean up
+        if os.path.exists(db_path):
+            os.unlink(db_path)
+
+
+def test_registry_vector_status_batch_flow():
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        registry = IngestionRegistry(db_path=db_path)
+        points = [
+            VectorPoint(
+                point_id="point_1",
+                chunk_id="chunk_1",
+                collection_name="local_wiki_1024",
+                alias_name="",
+                embedding_model="bge-m3:latest",
+                embedding_dim=1024,
+                vector_hash="h1",
+                status="pending",
+            ),
+            VectorPoint(
+                point_id="point_2",
+                chunk_id="chunk_2",
+                collection_name="local_wiki_1024",
+                alias_name="",
+                embedding_model="bge-m3:latest",
+                embedding_dim=1024,
+                vector_hash="h2",
+                status="pending",
+            ),
+        ]
+        registry.add_vector_points(points)
+
+        pending_chunk_ids = registry.existing_vector_chunk_ids(
+            ["chunk_1", "chunk_2"],
+            "local_wiki_1024",
+            statuses=["pending"],
+        )
+        assert pending_chunk_ids == {"chunk_1", "chunk_2"}
+
+        registry.update_vector_point_statuses(["point_1", "point_2"], "confirmed")
+        confirmed_chunk_ids = registry.existing_vector_chunk_ids(
+            ["chunk_1", "chunk_2"],
+            "local_wiki_1024",
+            statuses=["confirmed"],
+        )
+        assert confirmed_chunk_ids == {"chunk_1", "chunk_2"}
+    finally:
         if os.path.exists(db_path):
             os.unlink(db_path)
 
