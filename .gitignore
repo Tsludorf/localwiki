@@ -8,3 +8,12 @@ __pycache__/
 dist/
 build/
 localwiki_registry.db
+
+# Local integration secrets/config
+/config/integrations/factset.json
+/data/secrets/
+
+# FactSet
+/config/integrations/factset.json
+/data/secrets/
+/vendor/factset/
