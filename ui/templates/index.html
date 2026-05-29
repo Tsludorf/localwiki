@@ -14,6 +14,7 @@
         <p class="subtitle">Simple health view of your local AI services</p>
       </div>
       <button id="refreshBtn">Refresh now</button>
+      <button id="restartAllBtn" class="secondary">Restart all services</button>
     </header>
 
     <section id="overall" class="overall loading">
@@ -114,6 +115,7 @@
 
       <section>
         <h2>SDK / Package Readiness</h2>
+        <div id="factsetReadinessSummary" class="factset-summary"></div>
         <table id="factsetSdkTable" class="sdk-table">
           <thead><tr><th>Package</th><th>Status</th><th>Version</th></tr></thead>
           <tbody></tbody>
@@ -141,6 +143,7 @@ const metaEl = document.getElementById('meta');
 const portsEl = document.getElementById('ports');
 const rawEl = document.getElementById('raw');
 const refreshBtn = document.getElementById('refreshBtn');
+const restartAllBtn = document.getElementById('restartAllBtn');
 const overallEl = document.getElementById('overall');
 const quickStatsEl = document.getElementById('quickStats');
 const venvStartBtn = document.getElementById('venvStartBtn');
@@ -157,6 +160,7 @@ const localwikiTabStatusEl = document.getElementById('localwikiTabStatus');
 const factsetTabStatusEl = document.getElementById('factsetTabStatus');
 const serviceActionOutputEl = document.getElementById('serviceActionOutput');
 const factsetStatusGridEl = document.getElementById('factsetStatusGrid');
+const factsetReadinessSummaryEl = document.getElementById('factsetReadinessSummary');
 const factsetSdkTbodyEl = document.querySelector('#factsetSdkTable tbody');
 const factsetConfigPathEl = document.getElementById('factsetConfigPath');
 const factsetConfigUploadEl = document.getElementById('factsetConfigUpload');
@@ -395,6 +399,33 @@ function formatServiceActionResult(data) {
   return chunks.join('\n');
 }
 
+function formatRestartAllResult(data) {
+  const results = Array.isArray(data.results) ? data.results : [];
+  const lines = [
+    `Restart all status: ${data.ok ? 'OK' : 'FAILED'}`,
+    `Ran at: ${formatDateEST(data.ran_at)}`,
+    '',
+  ];
+
+  results.forEach((item) => {
+    lines.push(`- ${item.service || 'unknown'}: ${item.ok ? 'OK' : 'FAILED'}${item.exit_code == null ? '' : ` (exit ${item.exit_code})`}`);
+  });
+
+  return lines.join('\n');
+}
+
+async function restartAllServices() {
+  serviceActionOutputEl.textContent = 'Restarting all services...';
+  try {
+    const res = await fetch('/api/services/restart-all', { method: 'POST' });
+    const data = await res.json();
+    serviceActionOutputEl.textContent = formatRestartAllResult(data);
+    await refresh();
+  } catch (err) {
+    serviceActionOutputEl.textContent = `Restart all failed: ${err}`;
+  }
+}
+
 function renderLocalwikiStatus(data) {
   const totals = data.totals || {};
   localwikiSummaryEl.innerHTML = `
@@ -464,6 +495,7 @@ function renderFactsetStatus(data) {
     <div><strong>Token Expires At</strong></div><div>${esc(pretty(data.token_expires_at))}</div>
     <div><strong>Last Tested At</strong></div><div>${esc(pretty(data.last_tested_at))}</div>
     <div><strong>Error Summary</strong></div><div>${esc(pretty(data.last_error_summary))}</div>
+    <div><strong>SDK Utilities Installed</strong></div><div>${data.sdk_utilities_installed ? 'Yes' : 'No'}</div>
   `;
 
   if (data.config_path_display) {
@@ -472,6 +504,14 @@ function renderFactsetStatus(data) {
 
   factsetSdkTbodyEl.innerHTML = '';
   const sdk = data.sdk || {};
+  const sdkNames = Object.keys(sdk);
+  const installedCount = sdkNames.filter((name) => Boolean((sdk[name] || {}).installed)).length;
+  factsetReadinessSummaryEl.innerHTML = `
+    <div class="stat ${data.sdk_utilities_installed ? 'good' : 'bad'}"><strong>${data.sdk_utilities_installed ? 'Ready' : 'Needs Setup'}</strong><span>SDK Utilities</span></div>
+    <div class="stat"><strong>${installedCount}/${sdkNames.length}</strong><span>Packages Installed</span></div>
+    <div class="stat ${healthy ? 'good' : 'bad'}"><strong>${healthy ? 'Live' : 'Check Needed'}</strong><span>Connection State</span></div>
+  `;
+
   Object.keys(sdk).forEach((name) => {
     const item = sdk[name] || {};
     const tr = document.createElement('tr');
@@ -616,6 +656,7 @@ async function refresh() {
 }
 
 refreshBtn.addEventListener('click', refresh);
+restartAllBtn.addEventListener('click', restartAllServices);
 venvStartBtn.addEventListener('click', startLocalwikiVenv);
 sourcesUpdateBtn.addEventListener('click', runSourcesUpdate);
 factsetSaveBtn.addEventListener('click', saveFactsetConfigPath);
