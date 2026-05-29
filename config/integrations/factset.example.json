@@ -1,0 +1,4 @@
+{
+  "auth_method": "oauth2_client_credentials",
+  "config_path": "/secure/factset/app-config.json"
+}

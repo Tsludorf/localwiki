@@ -89,6 +89,11 @@ SERVICE_RESTART_COMMANDS: dict[str, str] = {
 FACTSET_STATE_PATH = LOCALWIKI_ROOT / "config" / "integrations" / "factset.json"
 FACTSET_UPLOAD_DIR = LOCALWIKI_ROOT / "data" / "secrets" / "factset"
 FACTSET_UPLOAD_PATH = FACTSET_UPLOAD_DIR / "app-config.json"
+FACTSET_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+FACTSET_ALLOWED_BASE_DIRS = [
+    Path("/secure/factset"),
+    LOCALWIKI_ROOT / "data" / "secrets" / "factset",
+]
 FACTSET_PACKAGES = [
     "fds.sdk.utils",
     "fds.sdk.FactSetEntity",
@@ -359,10 +364,31 @@ def _factset_token_status(expires_at: Any) -> str:
 def _sanitize_factset_error(exc: Exception) -> str:
     msg = str(exc) or exc.__class__.__name__
     lowered = msg.lower()
-    for blocked in ["private", "secret", "token", "jwk", "key", "passphrase"]:
+    for blocked in ["private key", "client_secret", "access_token", "refresh_token", "jwk", "passphrase"]:
         if blocked in lowered:
             return "Invalid FactSet OAuth configuration."
+    if "-----begin" in lowered and "key-----" in lowered:
+        return "Invalid FactSet OAuth configuration."
     return clip_text(msg, 240)
+
+
+def _is_allowed_factset_config_path(path: Path) -> bool:
+    enforce_scope = os.getenv("FACTSET_ENFORCE_PATH_SCOPE", "0").strip() == "1"
+    if not enforce_scope:
+        return True
+
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        return False
+
+    for base in FACTSET_ALLOWED_BASE_DIRS:
+        try:
+            resolved.relative_to(base.resolve(strict=False))
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _decode_jwt_exp(token: str) -> str | None:
@@ -773,6 +799,8 @@ def api_factset_config():
         return jsonify({"ok": False, "configured": False, "message": "Config file is unreadable."}), 400
     if path.suffix.lower() != ".json":
         return jsonify({"ok": False, "configured": False, "message": "Config filename should end with .json."}), 400
+    if not _is_allowed_factset_config_path(path):
+        return jsonify({"ok": False, "configured": False, "message": "Config path is outside allowed directories.", "error_code": "FACTSET_CONFIG_PATH_NOT_ALLOWED"}), 400
 
     state = _load_factset_state()
     state["auth_method"] = "oauth2_client_credentials"
@@ -785,6 +813,10 @@ def api_factset_config():
 
 @app.route("/api/integrations/factset/upload", methods=["POST"])
 def api_factset_upload():
+    content_length = request.content_length or 0
+    if content_length > FACTSET_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False, "message": "Upload too large.", "error_code": "FACTSET_UPLOAD_TOO_LARGE"}), 413
+
     body = request.get_json(silent=True) or {}
     filename = str(body.get("filename") or "").strip()
     content = str(body.get("content") or "")
@@ -887,6 +919,7 @@ def api_factset_test():
 @app.route("/api/integrations/factset/clear", methods=["POST"])
 def api_factset_clear():
     state = _load_factset_state()
+    state["auth_method"] = "oauth2_client_credentials"
     state["config_source"] = "not_set"
     state["config_path"] = None
     state["uploaded_filename"] = None
