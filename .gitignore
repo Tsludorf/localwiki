@@ -17,3 +17,5 @@ localwiki_registry.db
 /config/integrations/factset.json
 /data/secrets/
 /vendor/factset/
+secrets/factset/LocalWiki JWT-config.json
+secrets/factset/
