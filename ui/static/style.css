@@ -219,6 +219,13 @@ li { margin-bottom: 8px; }
   overflow: hidden;
 }
 
+.factset-summary {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
 .sdk-table th,
 .sdk-table td {
   text-align: left;

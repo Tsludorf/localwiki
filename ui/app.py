@@ -410,6 +410,8 @@ def _extract_token_expiry(token_obj: Any) -> str | None:
 def get_factset_status_payload() -> dict[str, Any]:
     state = _load_factset_state()
     config_path, config_source = _resolve_factset_config(state)
+    sdk = _factset_sdk_status()
+    sdk_installed = all(item.get("installed") for item in sdk.values())
     return {
         "configured": bool(config_path),
         "auth_method": "oauth2_client_credentials",
@@ -421,7 +423,8 @@ def get_factset_status_payload() -> dict[str, Any]:
         "token_status": _factset_token_status(state.get("token_expires_at")),
         "token_expires_at": state.get("token_expires_at"),
         "last_error_summary": state.get("last_error_summary"),
-        "sdk": _factset_sdk_status(),
+        "sdk_utilities_installed": sdk_installed,
+        "sdk": sdk,
     }
 
 
@@ -750,6 +753,19 @@ def api_service_restart():
     service_name = str(body.get("service") or "").strip()
     result = restart_service(service_name)
     return jsonify(result), (200 if result.get("ok") else 502)
+
+
+@app.route("/api/services/restart-all", methods=["POST"])
+def api_services_restart_all():
+    results: list[dict[str, Any]] = []
+    ok = True
+    for service in sorted(SERVICES, key=lambda item: item["priority"]):
+        outcome = restart_service(service["name"])
+        results.append(outcome)
+        if not outcome.get("ok"):
+            ok = False
+
+    return jsonify({"ok": ok, "results": results, "ran_at": now_iso()}), (200 if ok else 502)
 
 
 @app.route("/api/integrations/factset/status")
