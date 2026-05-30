@@ -80,16 +80,18 @@ LOCALWIKI_ALLOWED_COMMANDS = {
 }
 LOCALWIKI_DEFAULT_SOURCES_PATH = str(Path("~/Desktop/wiki_sources").expanduser())
 SERVICE_RESTART_COMMANDS: dict[str, str] = {
-    "AnythingLLM": "docker restart anythingllm || docker restart anything-llm || docker restart anything_llm",
-    "Ollama": "pkill -f 'ollama serve' ; nohup ollama serve >/tmp/kilo/ollama.log 2>&1 </dev/null &",
-    "n8n": "docker restart n8n || docker restart n8n-main || pkill -f 'n8n start' ; nohup n8n start >/tmp/kilo/n8n.log 2>&1 </dev/null &",
-    "Qdrant": "docker restart qdrant || docker restart qdrant-main",
+    "AnythingLLM": "docker restart ai-anythingllm || docker restart anythingllm || docker restart anything-llm || docker restart anything_llm",
+    "Ollama": "docker restart ai-ollama || docker restart ollama || (pkill -f '[o]llama serve' || true ; nohup ollama serve >/tmp/kilo/ollama.log 2>&1 </dev/null &)",
+    "n8n": "docker restart ai-n8n || docker restart n8n || docker restart n8n-main || (pkill -f '[n]8n start' || true ; nohup n8n start >/tmp/kilo/n8n.log 2>&1 </dev/null &)",
+    "Qdrant": "docker restart ai-qdrant || docker restart qdrant || docker restart qdrant-main",
 }
+UI_RESTART_SCRIPT = LOCALWIKI_ROOT / "scripts" / "start-warlock-dashboard.sh"
 
 FACTSET_STATE_PATH = LOCALWIKI_ROOT / "config" / "integrations" / "factset.json"
 FACTSET_UPLOAD_DIR = LOCALWIKI_ROOT / "data" / "secrets" / "factset"
 FACTSET_UPLOAD_PATH = FACTSET_UPLOAD_DIR / "app-config.json"
 FACTSET_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+FACTSET_SDK_RUN_MAX_BYTES = 256 * 1024
 FACTSET_ALLOWED_BASE_DIRS = [
     Path("/secure/factset"),
     LOCALWIKI_ROOT / "data" / "secrets" / "factset",
@@ -103,6 +105,209 @@ FACTSET_PACKAGES = [
     "fds.sdk.GlobalFilings",
     "fds.sdk.Formula",
     "fds.sdk.FactSetNER",
+]
+FACTSET_SDK_DOCS: list[dict[str, Any]] = [
+    {
+        "package": "fds.sdk.FactSetEntity",
+        "label": "Entity",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/FactSetEntity/v1",
+        "operations": [
+            {
+                "api_class": "EntityReferenceApi",
+                "operation_id": "get_entity_references",
+                "method": "GET",
+                "path": "/factset-entity/v1/entity-references",
+                "description": "Entity reference profile for one or more ids.",
+                "sample_query": {"ids": "AAPL-US,TSLA-US"},
+            },
+            {
+                "api_class": "EntitySecuritiesApi",
+                "operation_id": "get_entity_securities",
+                "method": "GET",
+                "path": "/factset-entity/v1/entity-securities",
+                "description": "Equity listings and debt instruments for an entity.",
+                "sample_query": {"ids": "AAPL-US"},
+            },
+            {
+                "api_class": "EntityStructureApi",
+                "operation_id": "get_ultimate_entity_structure",
+                "method": "GET",
+                "path": "/factset-entity/v1/ultimate-entity-structures",
+                "description": "Ultimate parent hierarchy and control levels.",
+                "sample_query": {"ids": "AAPL-US"},
+            },
+        ],
+    },
+    {
+        "package": "fds.sdk.FactSetFundamentals",
+        "label": "Fundamentals",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/FactSetFundamentals/v2",
+        "operations": [
+            {
+                "api_class": "CompanyReportsApi",
+                "operation_id": "get_fundamentals",
+                "method": "GET",
+                "path": "/company-reports/fundamentals",
+                "description": "Company fundamentals for a list of identifiers.",
+                "sample_query": {"ids": "AAPL-US", "metrics": "FF_SALES,FF_EPS"},
+            },
+            {
+                "api_class": "FactSetFundamentalsApi",
+                "operation_id": "get_fds_fundamentals_for_list",
+                "method": "POST",
+                "path": "/fundamentals",
+                "description": "Bulk fundamentals retrieval via POST payload.",
+                "sample_body": {"ids": ["AAPL-US", "MSFT-US"], "metrics": ["FF_SALES", "FF_EPS"]},
+            },
+            {
+                "api_class": "FundamentalsPointInTimeApi",
+                "operation_id": "post_fundamentals_pit_data",
+                "method": "POST",
+                "path": "/point-in-time",
+                "description": "Point-in-time fundamentals for historical testing.",
+                "sample_body": {"ids": ["AAPL-US"], "metrics": ["FF_EPS"], "asOfDate": "2025-12-31"},
+            },
+        ],
+    },
+    {
+        "package": "fds.sdk.FactSetEstimates",
+        "label": "Estimates",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/FactSetEstimates/v2",
+        "operations": [
+            {
+                "api_class": "ActualsApi",
+                "operation_id": "get_actuals",
+                "method": "GET",
+                "path": "/factset-estimates/v2/actuals",
+                "description": "Reported actual values for ids and fiscal periods.",
+                "sample_query": {"ids": "AAPL-US", "metrics": "EPS", "fiscalPeriod": "2024Q4"},
+            },
+            {
+                "api_class": "ConsensusApi",
+                "operation_id": "get_fixed_consensus",
+                "method": "GET",
+                "path": "/factset-estimates/v2/fixed-consensus",
+                "description": "Consensus estimates for fixed fiscal periods.",
+                "sample_query": {"ids": "AAPL-US", "metrics": "EPS", "periodicity": "ANN"},
+            },
+            {
+                "api_class": "BrokerDetailApi",
+                "operation_id": "get_rolling_detail",
+                "method": "GET",
+                "path": "/factset-estimates/v2/rolling-detail",
+                "description": "Broker-level estimate details for rolling periods.",
+                "sample_query": {"ids": "AAPL-US", "metrics": "EPS"},
+            },
+        ],
+    },
+    {
+        "package": "fds.sdk.FactSetPrices",
+        "label": "Prices",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/FactSetPrices/v1",
+        "operations": [
+            {
+                "api_class": "PricesApi",
+                "operation_id": "get_security_prices",
+                "method": "GET",
+                "path": "/factset-prices/v1/prices",
+                "description": "Security price history for a date range.",
+                "sample_query": {"ids": "AAPL-US", "startDate": "2025-01-01", "endDate": "2025-01-31"},
+            },
+            {
+                "api_class": "DividendsApi",
+                "operation_id": "get_security_dividends",
+                "method": "GET",
+                "path": "/factset-prices/v1/dividends",
+                "description": "Dividend events for selected securities.",
+                "sample_query": {"ids": "AAPL-US", "startDate": "2024-01-01", "endDate": "2025-01-01"},
+            },
+            {
+                "api_class": "SplitsApi",
+                "operation_id": "get_security_splits",
+                "method": "GET",
+                "path": "/factset-prices/v1/splits",
+                "description": "Split history to validate adjusted-price workflows.",
+                "sample_query": {"ids": "AAPL-US", "startDate": "2019-01-01", "endDate": "2026-01-01"},
+            },
+        ],
+    },
+    {
+        "package": "fds.sdk.GlobalFilings",
+        "label": "Global Filings",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/GlobalFilings/v2",
+        "operations": [
+            {
+                "api_class": "FilingsAPIApi",
+                "operation_id": "get_filings",
+                "method": "GET",
+                "path": "/search",
+                "description": "Search filing documents and metadata.",
+                "sample_query": {"source": "EDGAR", "query": "10-K AAPL"},
+            },
+            {
+                "api_class": "FilingsAPIApi",
+                "operation_id": "get_count",
+                "method": "GET",
+                "path": "/count",
+                "description": "Count filings for query planning.",
+                "sample_query": {"source": "EDGAR", "query": "10-Q MSFT"},
+            },
+            {
+                "api_class": "MetaApi",
+                "operation_id": "get_sources",
+                "method": "GET",
+                "path": "/meta/sources",
+                "description": "List available filing sources.",
+                "sample_query": {},
+            },
+        ],
+    },
+    {
+        "package": "fds.sdk.Formula",
+        "label": "Formula",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/Formula/v1",
+        "operations": [
+            {
+                "api_class": "CrossSectionalApi",
+                "operation_id": "get_cross_sectional_data_for_list",
+                "method": "POST",
+                "path": "/cross-sectional",
+                "description": "Cross-sectional formula screen outputs.",
+                "sample_body": {"ids": ["AAPL-US", "MSFT-US"], "formulas": ["FF_SALES(ANN_R,0)"]},
+            },
+            {
+                "api_class": "TimeSeriesApi",
+                "operation_id": "get_time_series_data_for_list",
+                "method": "POST",
+                "path": "/time-series",
+                "description": "Time-series formula outputs for charting/backtests.",
+                "sample_body": {"ids": ["AAPL-US"], "formulas": ["P_PRICE"], "calendar": "FIVEDAY"},
+            },
+            {
+                "api_class": "BatchProcessingApi",
+                "operation_id": "get_batch_status",
+                "method": "GET",
+                "path": "/batch-status",
+                "description": "Track asynchronous Formula batch jobs.",
+                "sample_query": {"batchId": "replace-with-batch-id"},
+            },
+        ],
+    },
+    {
+        "package": "fds.sdk.FactSetNER",
+        "label": "NER",
+        "homepage": "https://github.com/FactSet/enterprise-sdk/tree/main/code/python/FactSetNER/v2",
+        "operations": [
+            {
+                "api_class": "EntitiesApi",
+                "operation_id": "post_entities_entities",
+                "method": "POST",
+                "path": "/cognitive/ner/v2/entities",
+                "description": "Extract entities from text using FactSet NER.",
+                "sample_body": {"data": [{"id": "doc-1", "text": "Apple and Microsoft reported earnings."}]},
+            },
+        ],
+    },
 ]
 
 
@@ -454,6 +659,266 @@ def get_factset_status_payload() -> dict[str, Any]:
     }
 
 
+def get_factset_sdk_catalog_payload() -> dict[str, Any]:
+    package_status = _factset_sdk_status()
+    packages: list[dict[str, Any]] = []
+    operations_total = 0
+
+    for pkg in FACTSET_SDK_DOCS:
+        pkg_name = str(pkg.get("package") or "")
+        status = package_status.get(pkg_name, {"installed": False, "version": None})
+        operations: list[dict[str, Any]] = []
+
+        for op in pkg.get("operations", []):
+            operations_total += 1
+            method = str(op.get("method") or "GET")
+            path = str(op.get("path") or "")
+            operation_id = str(op.get("operation_id") or "")
+            operation_key = f"{pkg_name}::{operation_id}::{method.upper()}::{path}"
+            sample_query = op.get("sample_query")
+            sample_body = op.get("sample_body")
+            operations.append(
+                {
+                    "operation_key": operation_key,
+                    "api_class": op.get("api_class"),
+                    "operation_id": operation_id,
+                    "method": method,
+                    "path": path,
+                    "description": op.get("description"),
+                    "sample_query": sample_query,
+                    "sample_body": sample_body,
+                    "test_stub": {
+                        "name": f"factset_{op.get('operation_id')}",
+                        "package": pkg_name,
+                        "request": {
+                            "method": method,
+                            "path": op.get("path"),
+                            "query": sample_query or {},
+                            "body": sample_body,
+                        },
+                        "assertions": [
+                            "status_code in [200, 202]",
+                            "response has non-empty data payload",
+                        ],
+                        "notes": [
+                            "Requires valid FactSet OAuth credentials.",
+                            "Replace placeholder ids and dates before running.",
+                        ],
+                    },
+                }
+            )
+
+        packages.append(
+            {
+                "package": pkg_name,
+                "label": pkg.get("label"),
+                "homepage": pkg.get("homepage"),
+                "installed": bool(status.get("installed")),
+                "version": status.get("version"),
+                "operations": operations,
+            }
+        )
+
+    installed_count = sum(1 for pkg in packages if pkg.get("installed"))
+    return {
+        "generated_at": now_iso(),
+        "packages_total": len(packages),
+        "packages_installed": installed_count,
+        "operations_total": operations_total,
+        "packages": packages,
+    }
+
+
+def _find_factset_sdk_operation(operation_key: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    for pkg in FACTSET_SDK_DOCS:
+        pkg_name = str(pkg.get("package") or "")
+        for op in pkg.get("operations", []):
+            method = str(op.get("method") or "GET").upper()
+            path = str(op.get("path") or "")
+            op_id = str(op.get("operation_id") or "")
+            key = f"{pkg_name}::{op_id}::{method}::{path}"
+            if key == operation_key:
+                return pkg, op
+    return None, None
+
+
+def _resolve_factset_access_token() -> tuple[str | None, dict[str, Any] | None]:
+    state = _load_factset_state()
+    config_path, _config_source = _resolve_factset_config(state)
+    if not config_path:
+        return None, {
+            "error": "FactSet config path is not set. Configure OAuth first.",
+            "error_code": "FACTSET_CONFIG_NOT_SET",
+            "failure_class": "client",
+        }
+
+    path = Path(config_path).expanduser()
+    if not path.exists() or not path.is_file() or not os.access(path, os.R_OK):
+        return None, {
+            "error": "FactSet config path is missing or unreadable.",
+            "error_code": "FACTSET_CONFIG_UNREADABLE",
+            "failure_class": "client",
+        }
+
+    try:
+        auth_mod = importlib.import_module("fds.sdk.utils.authentication")
+    except Exception:
+        return None, {
+            "error": "FactSet SDK utilities are not installed.",
+            "error_code": "FACTSET_SDK_UTILS_MISSING",
+            "failure_class": "client",
+        }
+
+    try:
+        client = auth_mod.ConfidentialClient(str(path))
+        token_obj = client.get_access_token()
+    except Exception as exc:
+        return None, {
+            "error": _sanitize_factset_error(exc),
+            "error_code": "FACTSET_OAUTH_FAILED",
+            "failure_class": "client",
+        }
+
+    if isinstance(token_obj, str):
+        token = token_obj.strip()
+        return (token or None), (None if token else {
+            "error": "FactSet token response was empty.",
+            "error_code": "FACTSET_OAUTH_EMPTY_TOKEN",
+            "failure_class": "client",
+        })
+
+    if isinstance(token_obj, dict):
+        token = str(token_obj.get("access_token") or "").strip()
+        return (token or None), (None if token else {
+            "error": "FactSet token response did not include access_token.",
+            "error_code": "FACTSET_OAUTH_EMPTY_TOKEN",
+            "failure_class": "client",
+        })
+
+    token = str(token_obj or "").strip()
+    return (token or None), (None if token else {
+        "error": "FactSet token response was empty.",
+        "error_code": "FACTSET_OAUTH_EMPTY_TOKEN",
+        "failure_class": "client",
+    })
+
+
+def run_factset_sdk_sample(operation_key: str, query: dict[str, Any], body: Any) -> dict[str, Any]:
+    pkg, op = _find_factset_sdk_operation(operation_key)
+    if not pkg or not op:
+        return {
+            "ok": False,
+            "error": "Unsupported operation key.",
+            "error_code": "FACTSET_SDK_RUN_UNSUPPORTED_OPERATION",
+            "failure_class": "client",
+            "operation_key": operation_key,
+            "ran_at": now_iso(),
+        }
+
+    package_name = str(pkg.get("package") or "")
+    method = str(op.get("method") or "GET").upper()
+    path = str(op.get("path") or "")
+    operation_id = str(op.get("operation_id") or "")
+
+    token, token_error = _resolve_factset_access_token()
+    if token_error:
+        return {
+            "ok": False,
+            "error": token_error.get("error"),
+            "error_code": token_error.get("error_code"),
+            "failure_class": token_error.get("failure_class"),
+            "operation_key": operation_key,
+            "operation_id": operation_id,
+            "package": package_name,
+            "ran_at": now_iso(),
+        }
+
+    try:
+        sdk_mod = importlib.import_module(package_name)
+        host = str(sdk_mod.Configuration().host or "").rstrip("/")
+    except Exception:
+        return {
+            "ok": False,
+            "error": f"Failed to import SDK package: {package_name}",
+            "error_code": "FACTSET_SDK_PACKAGE_IMPORT_FAILED",
+            "failure_class": "client",
+            "operation_key": operation_key,
+            "operation_id": operation_id,
+            "package": package_name,
+            "ran_at": now_iso(),
+        }
+
+    if not host:
+        return {
+            "ok": False,
+            "error": f"No API host configured for package: {package_name}",
+            "error_code": "FACTSET_SDK_PACKAGE_HOST_MISSING",
+            "failure_class": "client",
+            "operation_key": operation_key,
+            "operation_id": operation_id,
+            "package": package_name,
+            "ran_at": now_iso(),
+        }
+
+    url = f"{host}/{path.lstrip('/')}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    request_kwargs: dict[str, Any] = {
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "timeout": 60,
+    }
+    if query:
+        request_kwargs["params"] = query
+    if method in {"POST", "PUT", "PATCH"} and body is not None:
+        request_kwargs["json"] = body
+
+    started = time.perf_counter()
+    try:
+        response = requests.request(**request_kwargs)
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "ok": response.ok,
+            "status_code": response.status_code,
+            "error_code": None if response.ok else "FACTSET_UPSTREAM_HTTP_ERROR",
+            "failure_class": "upstream" if not response.ok else None,
+            "latency_ms": latency_ms,
+            "package": package_name,
+            "operation_id": operation_id,
+            "operation_key": operation_key,
+            "method": method,
+            "url": url,
+            "query": query,
+            "request_body": body,
+            "response": parse_response_text(response),
+            "error": None if response.ok else f"FactSet API returned HTTP {response.status_code}",
+            "ran_at": now_iso(),
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "ok": False,
+            "status_code": None,
+            "error_code": "FACTSET_UPSTREAM_REQUEST_ERROR",
+            "failure_class": "server",
+            "latency_ms": latency_ms,
+            "package": package_name,
+            "operation_id": operation_id,
+            "operation_key": operation_key,
+            "method": method,
+            "url": url,
+            "query": query,
+            "request_body": body,
+            "response": None,
+            "error": _sanitize_factset_error(exc),
+            "ran_at": now_iso(),
+        }
+
+
 def build_snapshot() -> dict[str, Any]:
     snapshot = {
         "generated_at": now_iso(),
@@ -693,6 +1158,50 @@ def restart_service(service_name: str) -> dict[str, Any]:
         }
 
 
+def restart_ui_service() -> dict[str, Any]:
+    if not UI_RESTART_SCRIPT.exists():
+        return {
+            "ok": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": f"Restart script not found: {UI_RESTART_SCRIPT}",
+            "service": "Warlock UI",
+            "latency_ms": 0,
+            "ran_at": now_iso(),
+        }
+
+    started = time.perf_counter()
+    try:
+        subprocess.Popen(
+            ["bash", "-lc", f"sleep 1 && \"{UI_RESTART_SCRIPT}\""],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "Scheduled UI restart in 1 second.",
+            "stderr": "",
+            "service": "Warlock UI",
+            "latency_ms": latency_ms,
+            "ran_at": now_iso(),
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "ok": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": repr(exc),
+            "service": "Warlock UI",
+            "latency_ms": latency_ms,
+            "ran_at": now_iso(),
+        }
+
+
 @app.route("/")
 def index() -> str:
     return render_template(
@@ -794,9 +1303,75 @@ def api_services_restart_all():
     return jsonify({"ok": ok, "results": results, "ran_at": now_iso()}), (200 if ok else 502)
 
 
+@app.route("/api/services/restart-ui", methods=["POST"])
+def api_service_restart_ui():
+    result = restart_ui_service()
+    return jsonify(result), (202 if result.get("ok") else 502)
+
+
 @app.route("/api/integrations/factset/status")
 def api_factset_status():
     return jsonify(get_factset_status_payload())
+
+
+@app.route("/api/integrations/factset/sdk-options")
+def api_factset_sdk_options():
+    return jsonify(get_factset_sdk_catalog_payload())
+
+
+@app.route("/api/integrations/factset/sdk-run-sample", methods=["POST"])
+def api_factset_sdk_run_sample():
+    content_length = request.content_length or 0
+    if content_length > FACTSET_SDK_RUN_MAX_BYTES:
+        return jsonify({"ok": False, "error": "Request payload too large.", "error_code": "FACTSET_SDK_RUN_PAYLOAD_TOO_LARGE"}), 413
+
+    try:
+        raw_body = request.get_data(cache=False)
+    except Exception:
+        return jsonify({"ok": False, "error": "Unable to read request body.", "error_code": "FACTSET_SDK_RUN_BODY_READ_ERROR"}), 400
+
+    if len(raw_body) > FACTSET_SDK_RUN_MAX_BYTES:
+        return jsonify({"ok": False, "error": "Request payload too large.", "error_code": "FACTSET_SDK_RUN_PAYLOAD_TOO_LARGE"}), 413
+
+    if not raw_body:
+        body = {}
+    else:
+        try:
+            decoded = raw_body.decode("utf-8")
+            parsed = json.loads(decoded)
+        except Exception:
+            return jsonify({"ok": False, "error": "Invalid JSON payload.", "error_code": "FACTSET_SDK_RUN_INVALID_JSON"}), 400
+        body = parsed
+
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "Request body must be a JSON object.", "error_code": "FACTSET_SDK_RUN_INVALID_BODY"}), 400
+
+    try:
+        serialized = json.dumps(body)
+        if len(serialized.encode("utf-8")) > FACTSET_SDK_RUN_MAX_BYTES:
+            return jsonify({"ok": False, "error": "Request payload too large.", "error_code": "FACTSET_SDK_RUN_PAYLOAD_TOO_LARGE"}), 413
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid JSON payload.", "error_code": "FACTSET_SDK_RUN_INVALID_JSON"}), 400
+
+    operation_key = str(body.get("operation_key") or "").strip()
+    if not operation_key:
+        return jsonify({"ok": False, "error": "operation_key is required."}), 400
+
+    query = body.get("query")
+    if query is None:
+        query = {}
+    if not isinstance(query, dict):
+        return jsonify({"ok": False, "error": "query must be a JSON object."}), 400
+
+    request_body = body.get("body")
+    result = run_factset_sdk_sample(operation_key, query, request_body)
+    if result.get("status_code") is not None:
+        return jsonify(result), 200
+
+    if str(result.get("failure_class") or "") == "client":
+        return jsonify(result), 400
+
+    return jsonify(result), 502
 
 
 @app.route("/api/integrations/factset/config", methods=["POST"])

@@ -15,6 +15,7 @@
       </div>
       <button id="refreshBtn">Refresh now</button>
       <button id="restartAllBtn" class="secondary">Restart all services</button>
+      <button id="restartUiBtn" class="secondary">Restart UI service</button>
     </header>
 
     <section id="overall" class="overall loading">
@@ -35,6 +36,10 @@
       <button class="tab" data-tab-target="factsetTab">
         FactSet OAuth
         <span id="factsetTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+      </button>
+      <button class="tab" data-tab-target="factsetSdkTab">
+        FactSet SDK
+        <span id="factsetSdkTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
       </button>
     </nav>
 
@@ -135,6 +140,25 @@ python -m pip install fds.sdk.utils fds.sdk.FactSetEntity fds.sdk.FactSetFundame
         </ul>
       </section>
     </section>
+
+    <section id="factsetSdkTab" class="tab-panel">
+      <section>
+        <h2>FactSet SDK Explorer</h2>
+        <p class="help">SDK-backed operation catalog from FactSet docs with reusable test stubs for future smoke tests.</p>
+        <div class="factset-sdk-toolbar">
+          <input id="factsetSdkSearch" type="text" placeholder="Filter by package, endpoint, method, or operation..." />
+          <select id="factsetSdkMethodFilter">
+            <option value="all">All methods</option>
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+            <option value="DELETE">DELETE</option>
+          </select>
+          <button id="factsetSdkRefreshBtn" class="secondary">Refresh Options</button>
+        </div>
+        <div id="factsetSdkSummary" class="factset-summary"></div>
+        <div id="factsetSdkOptions" class="factset-sdk-packages"></div>
+      </section>
+    </section>
   </main>
 
 <script>
@@ -144,6 +168,7 @@ const portsEl = document.getElementById('ports');
 const rawEl = document.getElementById('raw');
 const refreshBtn = document.getElementById('refreshBtn');
 const restartAllBtn = document.getElementById('restartAllBtn');
+const restartUiBtn = document.getElementById('restartUiBtn');
 const overallEl = document.getElementById('overall');
 const quickStatsEl = document.getElementById('quickStats');
 const venvStartBtn = document.getElementById('venvStartBtn');
@@ -158,6 +183,7 @@ const tabPanels = document.querySelectorAll('.tab-panel');
 const servicesTabStatusEl = document.getElementById('servicesTabStatus');
 const localwikiTabStatusEl = document.getElementById('localwikiTabStatus');
 const factsetTabStatusEl = document.getElementById('factsetTabStatus');
+const factsetSdkTabStatusEl = document.getElementById('factsetSdkTabStatus');
 const serviceActionOutputEl = document.getElementById('serviceActionOutput');
 const factsetStatusGridEl = document.getElementById('factsetStatusGrid');
 const factsetReadinessSummaryEl = document.getElementById('factsetReadinessSummary');
@@ -170,6 +196,13 @@ const factsetUploadBtn = document.getElementById('factsetUploadBtn');
 const factsetTestBtn = document.getElementById('factsetTestBtn');
 const factsetClearBtn = document.getElementById('factsetClearBtn');
 const factsetRefreshBtn = document.getElementById('factsetRefreshBtn');
+const factsetSdkSearchEl = document.getElementById('factsetSdkSearch');
+const factsetSdkMethodFilterEl = document.getElementById('factsetSdkMethodFilter');
+const factsetSdkRefreshBtn = document.getElementById('factsetSdkRefreshBtn');
+const factsetSdkSummaryEl = document.getElementById('factsetSdkSummary');
+const factsetSdkOptionsEl = document.getElementById('factsetSdkOptions');
+
+let factsetSdkCatalog = null;
 
 function esc(str) {
   return String(str)
@@ -247,6 +280,7 @@ function getInitialTabFromUrl() {
   if (normalized === 'services') return 'servicesTab';
   if (normalized === 'localwiki') return 'localwikiTab';
   if (normalized === 'factset-oauth') return 'factsetTab';
+  if (normalized === 'factset-sdk') return 'factsetSdkTab';
   return 'servicesTab';
 }
 
@@ -426,6 +460,41 @@ async function restartAllServices() {
   }
 }
 
+async function waitForUiReady(timeoutMs = 30_000, intervalMs = 1_000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const res = await fetch('/api/status', { cache: 'no-store' });
+      if (res.ok) {
+        return true;
+      }
+    } catch (_err) {
+      // UI can be unavailable while restart is in progress.
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+async function restartUiService() {
+  serviceActionOutputEl.textContent = 'Restarting UI service...';
+  try {
+    const res = await fetch('/api/services/restart-ui', { method: 'POST' });
+    const data = await res.json();
+    serviceActionOutputEl.textContent = `${formatServiceActionResult(data)}\n\nWaiting for UI to become available...`;
+
+    const recovered = await waitForUiReady();
+    if (recovered) {
+      await refresh();
+      serviceActionOutputEl.textContent += '\nUI service is back online.';
+    } else {
+      serviceActionOutputEl.textContent += '\nUI service did not respond within 30 seconds.';
+    }
+  } catch (err) {
+    serviceActionOutputEl.textContent = `UI restart failed: ${err}`;
+  }
+}
+
 function renderLocalwikiStatus(data) {
   const totals = data.totals || {};
   localwikiSummaryEl.innerHTML = `
@@ -518,6 +587,193 @@ function renderFactsetStatus(data) {
     tr.innerHTML = `<td>${esc(name)}</td><td>${item.installed ? 'Installed' : 'Missing'}</td><td>${esc(pretty(item.version))}</td>`;
     factsetSdkTbodyEl.appendChild(tr);
   });
+}
+
+function stringifyObj(value) {
+  if (value === null || value === undefined) return 'null';
+  return JSON.stringify(value, null, 2);
+}
+
+function stringifyObjOrEmpty(value) {
+  if (value === null || value === undefined) return '';
+  return JSON.stringify(value, null, 2);
+}
+
+function parseSdkJsonObject(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return { ok: true, value: {} };
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: 'Query JSON must be an object.' };
+    }
+    return { ok: true, value: parsed };
+  } catch (err) {
+    return { ok: false, error: `Invalid query JSON: ${err}` };
+  }
+}
+
+function parseSdkJsonAny(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return { ok: true, value: null };
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (err) {
+    return { ok: false, error: `Invalid body JSON: ${err}` };
+  }
+}
+
+function formatSdkRunResult(data) {
+  const chunks = [
+    `Run status: ${data.ok ? 'OK' : 'FAILED'}`,
+    `Package: ${data.package || 'n/a'}`,
+    `Operation: ${data.operation_id || 'n/a'}`,
+    `HTTP: ${data.status_code == null ? 'n/a' : data.status_code}`,
+    `Latency: ${data.latency_ms == null ? 'n/a' : `${data.latency_ms}ms`}`,
+    `Method: ${data.method || 'n/a'}`,
+    `URL: ${data.url || 'n/a'}`,
+    `Ran at: ${formatDateEST(data.ran_at)}`,
+    '',
+    'Request query',
+    '-------------',
+    stringifyObj(data.query || {}),
+    '',
+    'Request body',
+    '------------',
+    stringifyObj(data.request_body),
+    '',
+    'Response',
+    '--------',
+    stringifyObj(data.response),
+  ];
+
+  if (data.error) {
+    chunks.push('', `Error: ${data.error}`);
+  }
+
+  return chunks.join('\n');
+}
+
+function getSdkOutputEl(outputId) {
+  if (!outputId) return null;
+  return document.getElementById(outputId);
+}
+
+function writeSdkOutput(outputId, value) {
+  const el = getSdkOutputEl(outputId);
+  if (el) {
+    el.textContent = String(value || '');
+  }
+}
+
+function passesSdkFilters(op, packageName) {
+  const search = String(factsetSdkSearchEl.value || '').trim().toLowerCase();
+  const method = String(factsetSdkMethodFilterEl.value || 'all').toUpperCase();
+  const opMethod = String(op.method || '').toUpperCase();
+
+  if (method !== 'ALL' && method !== opMethod) return false;
+  if (!search) return true;
+
+  const haystack = [
+    packageName,
+    op.api_class,
+    op.operation_id,
+    op.method,
+    op.path,
+    op.description,
+  ].map((v) => String(v || '').toLowerCase()).join(' ');
+
+  return haystack.includes(search);
+}
+
+function renderFactsetSdkCatalog() {
+  const payload = factsetSdkCatalog;
+  if (!payload || !Array.isArray(payload.packages)) {
+    factsetSdkSummaryEl.innerHTML = '';
+    factsetSdkOptionsEl.innerHTML = '<article class="sdk-package-section down"><p>No SDK option catalog loaded.</p></article>';
+    setTabStatus(factsetSdkTabStatusEl, false);
+    return;
+  }
+
+  const sections = [];
+  let shownOps = 0;
+  let opCounter = 0;
+
+  payload.packages.forEach((pkg) => {
+    const packageName = String(pkg.package || '');
+    const ops = Array.isArray(pkg.operations) ? pkg.operations : [];
+    const visibleOps = ops.filter((op) => passesSdkFilters(op, packageName));
+    if (!visibleOps.length) return;
+    shownOps += visibleOps.length;
+
+    const opRows = visibleOps.map((op, idx) => {
+      const opDomId = `sdk-op-${opCounter++}`;
+      const outputId = `sdk-output-${opDomId}`;
+      const stub = stringifyObj(op.test_stub || {});
+      const safeStub = encodeURIComponent(stub);
+      const safeOpKey = encodeURIComponent(op.operation_key || '');
+      return `
+        <details class="sdk-endpoint-details">
+          <summary class="sdk-endpoint-summary">
+            <strong>${esc(op.method)} ${esc(op.path)}</strong>
+            <span class="header-meta">${esc(op.operation_id)} • ${esc(op.api_class)}</span>
+          </summary>
+          <div class="sdk-endpoint-content">
+            <p>${esc(op.description || '')}</p>
+            <p><strong>Sample query (editable JSON object):</strong></p>
+            <textarea class="sdk-json-input sdk-query-input" data-op-id="${opDomId}" rows="4">${esc(stringifyObj(op.sample_query || {}))}</textarea>
+            <p><strong>Sample body (editable JSON; optional):</strong></p>
+            <textarea class="sdk-json-input sdk-body-input" data-op-id="${opDomId}" rows="5">${esc(stringifyObjOrEmpty(op.sample_body))}</textarea>
+            <p class="sdk-endpoint-actions">
+              <button class="secondary sdk-run-btn" data-op-id="${opDomId}" data-output-id="${outputId}" data-operation-key="${safeOpKey}">Run sample</button>
+              <button class="secondary sdk-stub-btn" data-output-id="${outputId}" data-stub="${safeStub}">Show test stub</button>
+              <button class="secondary sdk-copy-btn" data-output-id="${outputId}" data-stub="${safeStub}">Copy stub JSON</button>
+            </p>
+            <pre id="${outputId}" class="sdk-endpoint-output">No query run yet.</pre>
+          </div>
+        </details>
+      `;
+    }).join('');
+
+    sections.push(`
+      <section class="sdk-package-section ${pkg.installed ? 'up' : 'down'}">
+        <details class="sdk-package-details">
+          <summary class="sdk-package-summary">
+            <div>
+              <strong>${esc(pkg.label || packageName)}</strong>
+              <span class="header-meta"><code>${esc(packageName)}</code></span>
+            </div>
+            <span class="header-meta">${pkg.installed ? 'Installed' : 'Missing'} • v${esc(pkg.version || 'n/a')} • ${visibleOps.length} endpoint(s)</span>
+          </summary>
+          <div class="sdk-package-content">
+            <p><a href="${esc(pkg.homepage || '#')}" target="_blank" rel="noopener">SDK docs</a></p>
+            ${opRows}
+          </div>
+        </details>
+      </section>
+    `);
+  });
+
+  const healthy = shownOps > 0 && Number(payload.packages_installed || 0) > 0;
+  setTabStatus(factsetSdkTabStatusEl, healthy);
+  factsetSdkSummaryEl.innerHTML = `
+    <div class="stat ${payload.packages_installed === payload.packages_total ? 'good' : 'bad'}"><strong>${payload.packages_installed}/${payload.packages_total}</strong><span>Packages Installed</span></div>
+    <div class="stat ${healthy ? 'good' : 'bad'}"><strong>${shownOps}</strong><span>Visible Operations</span></div>
+    <div class="stat"><strong>${payload.operations_total || 0}</strong><span>Total Catalog Ops</span></div>
+  `;
+  factsetSdkOptionsEl.innerHTML = sections.join('') || '<article class="sdk-package-section"><p>No operations match the current filters.</p></article>';
+}
+
+async function refreshFactsetSdkCatalog() {
+  try {
+    const res = await fetch('/api/integrations/factset/sdk-options', { cache: 'no-store' });
+    const data = await res.json();
+    factsetSdkCatalog = data;
+    renderFactsetSdkCatalog();
+  } catch (err) {
+    factsetSdkOptionsEl.innerHTML = `<article class="sdk-package-section down"><p>Failed to load SDK options: ${esc(err)}</p></article>`;
+    setTabStatus(factsetSdkTabStatusEl, false);
+  }
 }
 
 async function refreshFactsetStatus() {
@@ -647,6 +903,9 @@ async function refresh() {
     rawEl.textContent = JSON.stringify(data, null, 2);
     await refreshLocalwiki();
     await refreshFactsetStatus();
+    if (!factsetSdkCatalog) {
+      await refreshFactsetSdkCatalog();
+    }
   } catch (err) {
     overallEl.className = 'overall bad';
     overallEl.querySelector('h2').textContent = 'Overall status: Unable to fetch data';
@@ -657,6 +916,7 @@ async function refresh() {
 
 refreshBtn.addEventListener('click', refresh);
 restartAllBtn.addEventListener('click', restartAllServices);
+restartUiBtn.addEventListener('click', restartUiService);
 venvStartBtn.addEventListener('click', startLocalwikiVenv);
 sourcesUpdateBtn.addEventListener('click', runSourcesUpdate);
 factsetSaveBtn.addEventListener('click', saveFactsetConfigPath);
@@ -664,6 +924,87 @@ factsetUploadBtn.addEventListener('click', uploadFactsetConfig);
 factsetTestBtn.addEventListener('click', testFactsetOauth);
 factsetClearBtn.addEventListener('click', clearFactsetConfig);
 factsetRefreshBtn.addEventListener('click', refreshFactsetStatus);
+factsetSdkRefreshBtn.addEventListener('click', refreshFactsetSdkCatalog);
+factsetSdkSearchEl.addEventListener('input', renderFactsetSdkCatalog);
+factsetSdkMethodFilterEl.addEventListener('change', renderFactsetSdkCatalog);
+factsetSdkOptionsEl.addEventListener('click', async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+
+  const runBtn = target.closest('.sdk-run-btn');
+  if (runBtn instanceof HTMLElement) {
+    const operationKey = decodeURIComponent(runBtn.dataset.operationKey || '');
+    const opId = String(runBtn.dataset.opId || '');
+    const outputId = String(runBtn.dataset.outputId || '');
+    if (!operationKey || !opId) {
+      writeSdkOutput(outputId, 'Missing operation metadata for SDK run.');
+      return;
+    }
+
+    const detailsEl = runBtn.closest('details') || runBtn.parentElement;
+    const queryInput = detailsEl ? detailsEl.querySelector(`.sdk-query-input[data-op-id="${opId}"]`) : null;
+    const bodyInput = detailsEl ? detailsEl.querySelector(`.sdk-body-input[data-op-id="${opId}"]`) : null;
+
+    const queryParsed = parseSdkJsonObject(queryInput ? queryInput.value : '{}');
+    if (!queryParsed.ok) {
+      writeSdkOutput(outputId, queryParsed.error);
+      return;
+    }
+
+    const bodyParsed = parseSdkJsonAny(bodyInput ? bodyInput.value : '');
+    if (!bodyParsed.ok) {
+      writeSdkOutput(outputId, bodyParsed.error);
+      return;
+    }
+
+    runBtn.setAttribute('disabled', 'true');
+    const previousLabel = runBtn.textContent;
+    runBtn.textContent = 'Running...';
+    writeSdkOutput(outputId, 'Running sample query against FactSet...');
+
+    try {
+      const res = await fetch('/api/integrations/factset/sdk-run-sample', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          operation_key: operationKey,
+          query: queryParsed.value,
+          body: bodyParsed.value,
+        }),
+      });
+      const data = await res.json();
+      writeSdkOutput(outputId, formatSdkRunResult(data));
+    } catch (err) {
+      writeSdkOutput(outputId, `Sample run failed: ${err}`);
+    } finally {
+      runBtn.removeAttribute('disabled');
+      runBtn.textContent = previousLabel || 'Run sample';
+    }
+    return;
+  }
+
+  const showBtn = target.closest('.sdk-stub-btn');
+  if (showBtn instanceof HTMLElement) {
+    const stub = decodeURIComponent(showBtn.dataset.stub || '%7B%7D');
+    writeSdkOutput(String(showBtn.dataset.outputId || ''), stub);
+    return;
+  }
+
+  const copyBtn = target.closest('.sdk-copy-btn');
+  if (copyBtn instanceof HTMLElement) {
+    const stub = decodeURIComponent(copyBtn.dataset.stub || '%7B%7D');
+    const outputId = String(copyBtn.dataset.outputId || '');
+    writeSdkOutput(outputId, stub);
+    try {
+      await navigator.clipboard.writeText(stub);
+      const out = getSdkOutputEl(outputId);
+      if (out) out.textContent += '\n\nCopied to clipboard.';
+    } catch (_err) {
+      const out = getSdkOutputEl(outputId);
+      if (out) out.textContent += '\n\nClipboard write failed in this browser context.';
+    }
+  }
+});
 document.querySelectorAll('[data-cmd]').forEach((btn) => {
   btn.addEventListener('click', () => runLocalwikiCommand(btn.dataset.cmd));
 });

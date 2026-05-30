@@ -200,6 +200,95 @@ li { margin-bottom: 8px; }
   margin: 10px 0;
 }
 
+.factset-sdk-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+#factsetSdkSearch,
+#factsetSdkMethodFilter {
+  padding: 8px 10px;
+  border: 1px solid #94a3b8;
+  border-radius: 8px;
+}
+
+#factsetSdkSearch {
+  min-width: 320px;
+  flex: 1;
+}
+
+.sdk-json-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid #94a3b8;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin-bottom: 8px;
+}
+
+.factset-sdk-packages {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sdk-package-section {
+  width: 100%;
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  border-left: 6px solid #64748b;
+  padding: 8px 12px;
+}
+
+.sdk-package-section.up { border-left-color: #16a34a; }
+.sdk-package-section.down { border-left-color: #dc2626; }
+
+.sdk-package-details > summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 2px;
+}
+
+.sdk-package-content {
+  padding: 4px 2px 8px;
+}
+
+.sdk-endpoint-details {
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  background: #f8fafc;
+}
+
+.sdk-endpoint-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.sdk-endpoint-content {
+  margin-top: 8px;
+}
+
+.sdk-endpoint-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sdk-endpoint-output {
+  margin-top: 10px;
+}
+
 #factsetConfigPath,
 #factsetConfigUpload {
   width: 100%;
