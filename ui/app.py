@@ -5,14 +5,18 @@ import base64
 import importlib
 import importlib.metadata
 import importlib.util
+import ipaddress
 import os
+import shutil
 import socket
 import sqlite3
 import stat
 import subprocess
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 
@@ -96,6 +100,458 @@ FACTSET_ALLOWED_BASE_DIRS = [
     Path("/secure/factset"),
     LOCALWIKI_ROOT / "data" / "secrets" / "factset",
 ]
+IMAGER_ROOT = Path("/home/loc-llm/facefusion")
+IMAGER_PYTHON = IMAGER_ROOT / ".venv" / "bin" / "python"
+IMAGER_SCRIPT = IMAGER_ROOT / "facefusion.py"
+IMAGER_SOURCE_DEFAULT = IMAGER_ROOT / "source_face.png"
+IMAGER_TARGET_DEFAULT = IMAGER_ROOT / "input_video.mp4"
+IMAGER_OUTPUT_DEFAULT = IMAGER_ROOT / "output_swapped_tuned.mp4"
+IMAGER_OUTPUT_STABLE = IMAGER_ROOT / "output_stable.mp4"
+IMAGER_OUTPUT_ENHANCED = IMAGER_ROOT / "output_enhanced.mp4"
+IMAGER_OUTPUT_PADDING60 = IMAGER_ROOT / "output_padding60.mp4"
+IMAGER_OUTPUT_MIGRAPHX = IMAGER_ROOT / "output_migraphx.mp4"
+IMAGER_ALLOWED_PROVIDERS = {"cpu", "migraphx", "rocm"}
+IMAGER_ALLOWED_MASK_TYPES = {"box", "occlusion"}
+IMAGER_ALLOWED_PROCESSORS = {"face_swapper", "face_enhancer"}
+IMAGER_ALLOWED_FACE_SWAPPER_MODELS = {"inswapper_128_fp16"}
+IMAGER_ALLOWED_FACE_ENHANCER_MODELS = {"gfpgan_1.4"}
+IMAGER_LOG_DIR = Path("/tmp/kilo")
+IMAGER_INPUT_DIR = IMAGER_ROOT / "inputs"
+IMAGER_TARGET_MAX_BYTES = 50 * 1024 * 1024
+IMAGER_ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
+IMAGER_EXTRACTOR_HOSTS = {"instagram.com", "www.instagram.com", "instagr.am"}
+IMAGER_COOKIES_DIR = IMAGER_ROOT / "data" / "secrets" / "imager"
+IMAGER_COOKIES_PATH = IMAGER_COOKIES_DIR / "instagram-cookies.txt"
+IMAGER_COOKIES_MAX_BYTES = 2 * 1024 * 1024
+IMAGER_STATE_LOCK = Lock()
+IMAGER_STATE: dict[str, Any] = {
+    "current": None,
+    "last": None,
+}
+
+
+def _imager_variant_defaults(variant: str) -> dict[str, Any]:
+    base = {
+        "source_path": str(IMAGER_SOURCE_DEFAULT),
+        "target_path": str(IMAGER_TARGET_DEFAULT),
+        "execution_provider": "cpu",
+        "face_selector_mode": "one",
+        "face_selector_order": "best-worst",
+        "face_mask_types": ["box", "occlusion"],
+        "face_mask_padding": [40, 40, 40, 40],
+        "processors": ["face_swapper"],
+        "face_swapper_model": "inswapper_128_fp16",
+        "face_enhancer_model": "gfpgan_1.4",
+        "output_video_quality": 90,
+    }
+    v = (variant or "baseline").strip().lower()
+    if v == "baseline":
+        base["output_path"] = str(IMAGER_OUTPUT_DEFAULT)
+    elif v == "stable":
+        base["output_path"] = str(IMAGER_OUTPUT_STABLE)
+    elif v == "enhanced":
+        base["processors"] = ["face_swapper", "face_enhancer"]
+        base["output_path"] = str(IMAGER_OUTPUT_ENHANCED)
+    elif v == "padding60":
+        base["face_mask_padding"] = [60, 60, 60, 60]
+        base["output_path"] = str(IMAGER_OUTPUT_PADDING60)
+    elif v == "migraphx":
+        base["execution_provider"] = "migraphx"
+        base["output_path"] = str(IMAGER_OUTPUT_MIGRAPHX)
+    else:
+        base["output_path"] = str(IMAGER_OUTPUT_DEFAULT)
+    return base
+
+
+def _coerce_padding(value: Any) -> tuple[list[int] | None, str | None]:
+    if value is None:
+        return None, None
+    if not isinstance(value, list) or len(value) != 4:
+        return None, "face_mask_padding must be a list of 4 integers."
+    try:
+        parsed = [int(v) for v in value]
+    except Exception:
+        return None, "face_mask_padding must contain integers."
+    if any(v < 0 or v > 120 for v in parsed):
+        return None, "face_mask_padding values must be between 0 and 120."
+    return parsed, None
+
+
+def _merge_imager_config(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    variant = str(payload.get("variant") or "baseline").strip().lower()
+    cfg = _imager_variant_defaults(variant)
+
+    for key in ["source_path", "target_path", "output_path", "execution_provider", "face_selector_mode", "face_selector_order", "face_swapper_model", "face_enhancer_model"]:
+        if payload.get(key) is not None:
+            cfg[key] = str(payload.get(key)).strip()
+
+    if payload.get("face_mask_types") is not None:
+        if not isinstance(payload.get("face_mask_types"), list):
+            return None, "face_mask_types must be a list."
+        cfg["face_mask_types"] = [str(v).strip() for v in payload.get("face_mask_types", []) if str(v).strip()]
+
+    if payload.get("processors") is not None:
+        if not isinstance(payload.get("processors"), list):
+            return None, "processors must be a list."
+        cfg["processors"] = [str(v).strip() for v in payload.get("processors", []) if str(v).strip()]
+
+    if payload.get("output_video_quality") is not None:
+        try:
+            cfg["output_video_quality"] = int(payload.get("output_video_quality"))
+        except Exception:
+            return None, "output_video_quality must be an integer."
+
+    padding, padding_error = _coerce_padding(payload.get("face_mask_padding"))
+    if padding_error:
+        return None, padding_error
+    if padding is not None:
+        cfg["face_mask_padding"] = padding
+
+    provider = str(cfg.get("execution_provider") or "cpu").lower()
+    if provider not in IMAGER_ALLOWED_PROVIDERS:
+        return None, "execution_provider must be one of: cpu, migraphx, rocm."
+    cfg["execution_provider"] = provider
+
+    mask_types = [str(v).lower() for v in cfg.get("face_mask_types") or []]
+    if not mask_types:
+        return None, "face_mask_types cannot be empty."
+    if any(v not in IMAGER_ALLOWED_MASK_TYPES for v in mask_types):
+        return None, "face_mask_types can only contain: box, occlusion."
+    cfg["face_mask_types"] = mask_types
+
+    processors = [str(v).lower() for v in cfg.get("processors") or []]
+    if not processors:
+        return None, "processors cannot be empty."
+    if any(v not in IMAGER_ALLOWED_PROCESSORS for v in processors):
+        return None, "processors can only contain: face_swapper, face_enhancer."
+    cfg["processors"] = processors
+
+    if str(cfg.get("face_swapper_model") or "") not in IMAGER_ALLOWED_FACE_SWAPPER_MODELS:
+        return None, "face_swapper_model must be inswapper_128_fp16."
+    if "face_enhancer" in processors and str(cfg.get("face_enhancer_model") or "") not in IMAGER_ALLOWED_FACE_ENHANCER_MODELS:
+        return None, "face_enhancer_model must be gfpgan_1.4 when face_enhancer is enabled."
+
+    quality = int(cfg.get("output_video_quality") or 0)
+    if quality < 1 or quality > 100:
+        return None, "output_video_quality must be between 1 and 100."
+
+    for path_key in ["source_path", "target_path", "output_path"]:
+        value = str(cfg.get(path_key) or "").strip()
+        if not value:
+            return None, f"{path_key} is required."
+        cfg[path_key] = str(Path(value).expanduser())
+
+    cfg["variant"] = variant
+    return cfg, None
+
+
+def _imager_command_from_config(cfg: dict[str, Any]) -> list[str]:
+    cmd = [
+        str(IMAGER_PYTHON),
+        str(IMAGER_SCRIPT),
+        "headless-run",
+        "--source-path", cfg["source_path"],
+        "--target-path", cfg["target_path"],
+        "--output-path", cfg["output_path"],
+        "--execution-providers", cfg["execution_provider"],
+        "--face-selector-mode", cfg["face_selector_mode"],
+        "--face-selector-order", cfg["face_selector_order"],
+        "--face-mask-types", *cfg["face_mask_types"],
+        "--face-mask-padding", *[str(v) for v in cfg["face_mask_padding"]],
+        "--processors", *cfg["processors"],
+        "--face-swapper-model", cfg["face_swapper_model"],
+        "--output-video-quality", str(cfg["output_video_quality"]),
+    ]
+    if "face_enhancer" in cfg["processors"]:
+        cmd.extend(["--face-enhancer-model", cfg["face_enhancer_model"]])
+    return cmd
+
+
+def _refresh_imager_state_locked() -> None:
+    current = IMAGER_STATE.get("current")
+    if not current:
+        return
+    proc: subprocess.Popen[str] | None = current.get("process")
+    if proc is None:
+        return
+    exit_code = proc.poll()
+    if exit_code is None:
+        current["status"] = "running"
+        return
+    current["status"] = "success" if exit_code == 0 else "failed"
+    current["exit_code"] = exit_code
+    current["finished_at"] = now_iso()
+    current.pop("process", None)
+    IMAGER_STATE["last"] = current
+    IMAGER_STATE["current"] = None
+
+
+def _imager_status_payload() -> dict[str, Any]:
+    with IMAGER_STATE_LOCK:
+        _refresh_imager_state_locked()
+        current = IMAGER_STATE.get("current")
+        last = IMAGER_STATE.get("last")
+
+        def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not job:
+                return None
+            payload = {k: v for k, v in job.items() if k != "process"}
+            return payload
+
+        cookies_exists = IMAGER_COOKIES_PATH.exists() and IMAGER_COOKIES_PATH.is_file()
+        cookies_size = None
+        if cookies_exists:
+            try:
+                cookies_size = IMAGER_COOKIES_PATH.stat().st_size
+            except Exception:
+                cookies_size = None
+
+        return {
+            "checked_at": now_iso(),
+            "facefusion_root": str(IMAGER_ROOT),
+            "inputs_root": str(IMAGER_INPUT_DIR),
+            "target_max_bytes": IMAGER_TARGET_MAX_BYTES,
+            "cookies_path": str(IMAGER_COOKIES_PATH),
+            "cookies_exists": cookies_exists,
+            "cookies_size_bytes": cookies_size,
+            "python_path": str(IMAGER_PYTHON),
+            "script_path": str(IMAGER_SCRIPT),
+            "python_exists": IMAGER_PYTHON.exists(),
+            "script_exists": IMAGER_SCRIPT.exists(),
+            "source_exists": Path(IMAGER_SOURCE_DEFAULT).exists(),
+            "target_exists": Path(IMAGER_TARGET_DEFAULT).exists(),
+            "current": _public_job(current),
+            "last": _public_job(last),
+        }
+
+
+def _run_imager_debug_command(command: list[str], timeout: int = 30) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(IMAGER_ROOT),
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "ok": result.returncode == 0,
+            "exit_code": result.returncode,
+            "stdout": clip_text(result.stdout, 8000),
+            "stderr": clip_text(result.stderr, 8000),
+            "latency_ms": latency_ms,
+            "ran_at": now_iso(),
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {
+            "ok": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": repr(exc),
+            "latency_ms": latency_ms,
+            "ran_at": now_iso(),
+        }
+
+
+def _sanitize_upload_name(name: str) -> str:
+    raw = Path(str(name or "video")).name
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)
+    cleaned = cleaned.strip("._") or "video"
+    return cleaned
+
+
+def _ensure_video_filename(name: str, fallback_ext: str = ".mp4") -> str:
+    cleaned = _sanitize_upload_name(name)
+    ext = Path(cleaned).suffix.lower()
+    if ext not in IMAGER_ALLOWED_VIDEO_EXTENSIONS:
+        cleaned = f"{Path(cleaned).stem or 'video'}{fallback_ext}"
+    return cleaned
+
+
+def _detect_extension_from_content_type(content_type: str | None) -> str:
+    ctype = str(content_type or "").lower()
+    if "mp4" in ctype:
+        return ".mp4"
+    if "quicktime" in ctype or "mov" in ctype:
+        return ".mov"
+    if "webm" in ctype:
+        return ".webm"
+    if "x-matroska" in ctype or "mkv" in ctype:
+        return ".mkv"
+    if "x-msvideo" in ctype or "avi" in ctype:
+        return ".avi"
+    return ".mp4"
+
+
+def _is_public_http_host(hostname: str) -> tuple[bool, str | None]:
+    host = str(hostname or "").strip().lower()
+    if not host:
+        return False, "Missing host in URL."
+    if host in {"localhost", "localhost.localdomain"}:
+        return False, "Localhost URLs are not allowed."
+
+    try:
+        addr_info = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, "Unable to resolve URL host."
+
+    if not addr_info:
+        return False, "Unable to resolve URL host."
+
+    seen: set[str] = set()
+    for item in addr_info:
+        sockaddr = item[4]
+        if not sockaddr:
+            continue
+        ip_text = str(sockaddr[0])
+        if ip_text in seen:
+            continue
+        seen.add(ip_text)
+        try:
+            ip_obj = ipaddress.ip_address(ip_text)
+        except Exception:
+            return False, "Resolved URL host is invalid."
+        if not ip_obj.is_global:
+            return False, f"Non-public URL host is not allowed: {ip_text}"
+
+    if not seen:
+        return False, "Unable to resolve URL host."
+
+    return True, None
+
+
+def _is_extractor_url(source_url: str) -> bool:
+    parsed = urlparse(source_url)
+    host = (parsed.netloc or "").lower()
+    return any(host == item or host.endswith(f".{item}") for item in IMAGER_EXTRACTOR_HOSTS)
+
+
+def _download_with_extractor(source_url: str) -> tuple[Path | None, dict[str, Any] | None]:
+    ytdlp_bin = shutil.which("yt-dlp") or shutil.which("youtube-dl")
+    if not ytdlp_bin:
+        return None, {
+            "ok": False,
+            "error": "yt-dlp is not installed. Install yt-dlp to download from Instagram links.",
+            "error_code": "IMAGER_EXTRACTOR_MISSING",
+        }
+
+    IMAGER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    start_ts = time.time()
+    output_template = str(IMAGER_INPUT_DIR / "downloaded-%(epoch)s-%(id)s.%(ext)s")
+    cmd = [
+        ytdlp_bin,
+        "--no-playlist",
+        "--max-filesize", "50M",
+        "--merge-output-format", "mp4",
+        "--no-progress",
+        "--restrict-filenames",
+        "--print", "after_move:filepath",
+        "-o", output_template,
+        source_url,
+    ]
+    using_cookies = IMAGER_COOKIES_PATH.exists() and IMAGER_COOKIES_PATH.is_file()
+    if using_cookies:
+        cmd[1:1] = ["--cookies", str(IMAGER_COOKIES_PATH)]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(IMAGER_ROOT),
+            text=True,
+            capture_output=True,
+            timeout=600,
+        )
+    except Exception as exc:
+        return None, {
+            "ok": False,
+            "error": repr(exc),
+            "error_code": "IMAGER_EXTRACTOR_FAILED",
+        }
+
+    if result.returncode != 0:
+        combined = clip_text(result.stderr or result.stdout or "Extractor failed.", 4000)
+        lowered = combined.lower()
+        if ("login required" in lowered or "rate-limit reached" in lowered or "requested content is not available" in lowered) and not using_cookies:
+            return None, {
+                "ok": False,
+                "error": "Instagram requires authenticated cookies for this URL. Upload a cookies.txt export and retry.",
+                "error_code": "IMAGER_EXTRACTOR_AUTH_REQUIRED",
+                "extractor_output": combined,
+                "exit_code": result.returncode,
+            }
+        if ("login required" in lowered or "rate-limit reached" in lowered or "requested content is not available" in lowered) and using_cookies:
+            return None, {
+                "ok": False,
+                "error": "Instagram authentication failed with current cookies. Refresh cookies.txt and retry.",
+                "error_code": "IMAGER_EXTRACTOR_AUTH_FAILED",
+                "extractor_output": combined,
+                "exit_code": result.returncode,
+            }
+        return None, {
+            "ok": False,
+            "error": combined,
+            "error_code": "IMAGER_EXTRACTOR_FAILED",
+            "exit_code": result.returncode,
+        }
+
+    output_path: Path | None = None
+    for line in reversed((result.stdout or "").splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists() and path.is_file():
+            output_path = path
+            break
+
+    if output_path is None:
+        recent = [
+            p for p in IMAGER_INPUT_DIR.glob("downloaded-*")
+            if p.is_file() and p.stat().st_mtime >= (start_ts - 2)
+        ]
+        if recent:
+            recent.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            output_path = recent[0]
+
+    if output_path is None or not output_path.exists() or not output_path.is_file():
+        return None, {
+            "ok": False,
+            "error": "Extractor completed but output file was not found.",
+            "error_code": "IMAGER_EXTRACTOR_OUTPUT_MISSING",
+        }
+
+    try:
+        size_bytes = output_path.stat().st_size
+    except Exception as exc:
+        return None, {
+            "ok": False,
+            "error": repr(exc),
+            "error_code": "IMAGER_EXTRACTOR_OUTPUT_INVALID",
+        }
+
+    if size_bytes > IMAGER_TARGET_MAX_BYTES:
+        try:
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None, {
+            "ok": False,
+            "error": "Downloaded file exceeds 50MB limit.",
+            "error_code": "IMAGER_TARGET_TOO_LARGE",
+        }
+
+    ext = output_path.suffix.lower()
+    if ext not in IMAGER_ALLOWED_VIDEO_EXTENSIONS:
+        return None, {
+            "ok": False,
+            "error": "Extractor did not produce a supported video format.",
+            "error_code": "IMAGER_TARGET_URL_NOT_VIDEO",
+        }
+
+    return output_path, None
 FACTSET_PACKAGES = [
     "fds.sdk.utils",
     "fds.sdk.FactSetEntity",
@@ -1520,6 +1976,471 @@ def api_factset_clear():
     state["last_error_summary"] = None
     _save_factset_state(state)
     return jsonify({"ok": True, "configured": False, "message": "FactSet integration config cleared."})
+
+
+@app.route("/imager")
+def imager() -> str:
+    return render_template(
+        "imager.html",
+        facefusion_root=str(IMAGER_ROOT),
+        source_default=str(IMAGER_SOURCE_DEFAULT),
+        target_default=str(IMAGER_TARGET_DEFAULT),
+        output_default=str(IMAGER_OUTPUT_DEFAULT),
+    )
+
+
+@app.route("/api/imager/status")
+def api_imager_status():
+    return jsonify(_imager_status_payload())
+
+
+@app.route("/api/imager/cookies/upload", methods=["POST"])
+def api_imager_cookies_upload():
+    content_length = request.content_length or 0
+    if content_length > IMAGER_COOKIES_MAX_BYTES:
+        return jsonify({"ok": False, "error": "Cookies upload exceeds size limit.", "error_code": "IMAGER_COOKIES_TOO_LARGE"}), 413
+
+    file_storage = request.files.get("cookies_file")
+    if not file_storage or not file_storage.filename:
+        return jsonify({"ok": False, "error": "Missing uploaded file field: cookies_file.", "error_code": "IMAGER_COOKIES_MISSING"}), 400
+
+    filename = Path(file_storage.filename).name.lower()
+    if not filename.endswith(".txt"):
+        return jsonify({"ok": False, "error": "Cookies file must be a .txt export.", "error_code": "IMAGER_COOKIES_INVALID_NAME"}), 400
+
+    try:
+        raw = file_storage.stream.read(IMAGER_COOKIES_MAX_BYTES + 1)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_COOKIES_READ_FAILED"}), 500
+
+    if not raw:
+        return jsonify({"ok": False, "error": "Cookies file is empty.", "error_code": "IMAGER_COOKIES_EMPTY"}), 400
+    if len(raw) > IMAGER_COOKIES_MAX_BYTES:
+        return jsonify({"ok": False, "error": "Cookies upload exceeds size limit.", "error_code": "IMAGER_COOKIES_TOO_LARGE"}), 413
+
+    try:
+        content = raw.decode("utf-8", errors="strict")
+    except Exception:
+        return jsonify({"ok": False, "error": "Cookies file must be UTF-8 text.", "error_code": "IMAGER_COOKIES_INVALID_ENCODING"}), 400
+
+    # Simple Netscape cookies format sanity check.
+    lowered = content.lower()
+    if "instagram.com" not in lowered and "# netscape http cookie file" not in lowered:
+        return jsonify({"ok": False, "error": "Uploaded cookies file does not look like a browser cookie export.", "error_code": "IMAGER_COOKIES_INVALID_FORMAT"}), 400
+
+    IMAGER_COOKIES_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(IMAGER_COOKIES_DIR, stat.S_IRWXU)
+    IMAGER_COOKIES_PATH.write_text(content, encoding="utf-8")
+    os.chmod(IMAGER_COOKIES_PATH, stat.S_IRUSR | stat.S_IWUSR)
+
+    return jsonify({
+        "ok": True,
+        "message": "Instagram cookies uploaded.",
+        "cookies_path": str(IMAGER_COOKIES_PATH),
+        "size_bytes": len(raw),
+    })
+
+
+@app.route("/api/imager/cookies/clear", methods=["POST"])
+def api_imager_cookies_clear():
+    try:
+        IMAGER_COOKIES_PATH.unlink(missing_ok=True)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_COOKIES_CLEAR_FAILED"}), 500
+    return jsonify({"ok": True, "message": "Instagram cookies cleared."})
+
+
+@app.route("/api/imager/target/upload", methods=["POST"])
+def api_imager_target_upload():
+    content_length = request.content_length or 0
+    if content_length > IMAGER_TARGET_MAX_BYTES:
+        return jsonify({
+            "ok": False,
+            "error": "Upload exceeds 50MB limit.",
+            "error_code": "IMAGER_TARGET_TOO_LARGE",
+        }), 413
+
+    file_storage = request.files.get("target_video")
+    if not file_storage or not file_storage.filename:
+        return jsonify({"ok": False, "error": "Missing uploaded file field: target_video.", "error_code": "IMAGER_TARGET_UPLOAD_MISSING"}), 400
+
+    source_name = _sanitize_upload_name(file_storage.filename)
+    src_ext = Path(source_name).suffix.lower()
+    if src_ext and src_ext not in IMAGER_ALLOWED_VIDEO_EXTENSIONS:
+        return jsonify({"ok": False, "error": "Unsupported video extension.", "error_code": "IMAGER_TARGET_UPLOAD_UNSUPPORTED"}), 400
+
+    IMAGER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    file_ext = src_ext if src_ext in IMAGER_ALLOWED_VIDEO_EXTENSIONS else ".mp4"
+    out_name = _ensure_video_filename(f"uploaded-{int(time.time())}-{source_name}", file_ext)
+    output_path = IMAGER_INPUT_DIR / out_name
+
+    total = 0
+    try:
+        with output_path.open("wb") as handle:
+            while True:
+                chunk = file_storage.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > IMAGER_TARGET_MAX_BYTES:
+                    handle.close()
+                    try:
+                        output_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return jsonify({
+                        "ok": False,
+                        "error": "Upload exceeds 50MB limit.",
+                        "error_code": "IMAGER_TARGET_TOO_LARGE",
+                    }), 413
+                handle.write(chunk)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_UPLOAD_FAILED"}), 500
+
+    return jsonify({
+        "ok": True,
+        "target_path": str(output_path),
+        "size_bytes": total,
+        "message": "Uploaded target video is ready.",
+    })
+
+
+@app.route("/api/imager/target/download", methods=["POST"])
+def api_imager_target_download():
+    body = request.get_json(silent=True) or {}
+    source_url = str(body.get("url") or "").strip()
+    if not source_url:
+        return jsonify({"ok": False, "error": "url is required.", "error_code": "IMAGER_TARGET_URL_REQUIRED"}), 400
+
+    parsed = urlparse(source_url)
+    if parsed.scheme not in {"http", "https"}:
+        return jsonify({"ok": False, "error": "Only http/https URLs are supported.", "error_code": "IMAGER_TARGET_URL_INVALID"}), 400
+
+    is_public, host_error = _is_public_http_host(parsed.hostname or "")
+    if not is_public:
+        return jsonify({"ok": False, "error": host_error or "URL host is not allowed.", "error_code": "IMAGER_TARGET_URL_BLOCKED"}), 400
+
+    if _is_extractor_url(source_url):
+        output_path, extractor_error = _download_with_extractor(source_url)
+        if extractor_error:
+            error_code = str(extractor_error.get("error_code") or "")
+            if error_code == "IMAGER_TARGET_TOO_LARGE":
+                status = 413
+            elif error_code in {"IMAGER_EXTRACTOR_AUTH_REQUIRED", "IMAGER_EXTRACTOR_AUTH_FAILED"}:
+                status = 401
+            elif error_code == "IMAGER_EXTRACTOR_MISSING":
+                status = 400
+            else:
+                status = 502
+            return jsonify(extractor_error), status
+        assert output_path is not None
+        try:
+            size_bytes = output_path.stat().st_size
+        except Exception:
+            size_bytes = None
+        return jsonify({
+            "ok": True,
+            "target_path": str(output_path),
+            "size_bytes": size_bytes,
+            "source_url": source_url,
+            "download_method": "extractor",
+            "message": "Downloaded target video is ready.",
+        })
+
+    IMAGER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        current_url = source_url
+        redirects_followed = 0
+        max_redirects = 5
+        while True:
+            current_parsed = urlparse(current_url)
+            if current_parsed.scheme not in {"http", "https"}:
+                return jsonify({"ok": False, "error": "Redirect target uses unsupported scheme.", "error_code": "IMAGER_TARGET_URL_INVALID"}), 400
+            is_public, host_error = _is_public_http_host(current_parsed.hostname or "")
+            if not is_public:
+                return jsonify({"ok": False, "error": host_error or "Redirect target host is not allowed.", "error_code": "IMAGER_TARGET_URL_BLOCKED"}), 400
+
+            resp = requests.get(current_url, stream=True, timeout=(10, 180), allow_redirects=False)
+            status_code = resp.status_code
+            if status_code in {301, 302, 303, 307, 308}:
+                location = str(resp.headers.get("location") or "").strip()
+                resp.close()
+                if not location:
+                    return jsonify({"ok": False, "error": "Redirect response missing Location header.", "error_code": "IMAGER_TARGET_DOWNLOAD_HTTP_ERROR", "status_code": status_code}), 502
+                if redirects_followed >= max_redirects:
+                    return jsonify({"ok": False, "error": "Too many redirects while downloading URL.", "error_code": "IMAGER_TARGET_TOO_MANY_REDIRECTS"}), 502
+                current_url = requests.compat.urljoin(current_url, location)
+                redirects_followed += 1
+                continue
+            break
+
+        with resp:
+            status_code = resp.status_code
+            if status_code >= 400:
+                return jsonify({
+                    "ok": False,
+                    "error": f"Download failed with HTTP {status_code}.",
+                    "error_code": "IMAGER_TARGET_DOWNLOAD_HTTP_ERROR",
+                    "status_code": status_code,
+                }), 502
+
+            final_url = str(resp.url or current_url or source_url)
+            final_parsed = urlparse(final_url)
+            hinted_name = Path(final_parsed.path).name or "downloaded-video"
+            content_type = str(resp.headers.get("content-type") or "")
+            content_length_header = resp.headers.get("content-length")
+
+            if content_length_header:
+                try:
+                    expected_size = int(content_length_header)
+                    if expected_size > IMAGER_TARGET_MAX_BYTES:
+                        return jsonify({
+                            "ok": False,
+                            "error": "Remote file exceeds 50MB limit.",
+                            "error_code": "IMAGER_TARGET_TOO_LARGE",
+                        }), 413
+                except Exception:
+                    pass
+
+            raw_ext = Path(hinted_name).suffix.lower()
+            is_video_content_type = content_type.lower().startswith("video/")
+            if not is_video_content_type:
+                return jsonify({
+                    "ok": False,
+                    "error": "URL response is not a video content type.",
+                    "error_code": "IMAGER_TARGET_URL_NOT_VIDEO",
+                    "content_type": content_type,
+                }), 400
+
+            ext = raw_ext if raw_ext in IMAGER_ALLOWED_VIDEO_EXTENSIONS else _detect_extension_from_content_type(content_type)
+
+            out_name = _ensure_video_filename(f"downloaded-{int(time.time())}-{hinted_name}", ext)
+            output_path = IMAGER_INPUT_DIR / out_name
+
+            total = 0
+            with output_path.open("wb") as handle:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > IMAGER_TARGET_MAX_BYTES:
+                        handle.close()
+                        try:
+                            output_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return jsonify({
+                            "ok": False,
+                            "error": "Remote file exceeds 50MB limit.",
+                            "error_code": "IMAGER_TARGET_TOO_LARGE",
+                        }), 413
+                    handle.write(chunk)
+
+    except requests.RequestException as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED"}), 502
+    except Exception as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED"}), 500
+
+    return jsonify({
+        "ok": True,
+        "target_path": str(output_path),
+        "size_bytes": total,
+        "source_url": source_url,
+        "message": "Downloaded target video is ready.",
+    })
+
+
+@app.route("/api/imager/run", methods=["POST"])
+def api_imager_run():
+    if not IMAGER_PYTHON.exists() or not IMAGER_SCRIPT.exists():
+        return jsonify({
+            "ok": False,
+            "error": "FaceFusion runtime is missing. Verify ~/facefusion and .venv setup.",
+            "error_code": "IMAGER_RUNTIME_MISSING",
+        }), 400
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "Request body must be a JSON object.", "error_code": "IMAGER_INVALID_BODY"}), 400
+
+    cfg, cfg_error = _merge_imager_config(body)
+    if cfg_error:
+        return jsonify({"ok": False, "error": cfg_error, "error_code": "IMAGER_INVALID_CONFIG"}), 400
+    assert cfg is not None
+
+    source = Path(cfg["source_path"])
+    target = Path(cfg["target_path"])
+    output = Path(cfg["output_path"])
+    if not source.exists() or not source.is_file():
+        return jsonify({"ok": False, "error": f"Source image missing: {source}", "error_code": "IMAGER_SOURCE_MISSING"}), 400
+    if not target.exists() or not target.is_file():
+        return jsonify({"ok": False, "error": f"Target video missing: {target}", "error_code": "IMAGER_TARGET_MISSING"}), 400
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = _imager_command_from_config(cfg)
+    run_id = uuid.uuid4().hex[:12]
+    log_path = IMAGER_LOG_DIR / f"facefusion-{run_id}.log"
+
+    with IMAGER_STATE_LOCK:
+        _refresh_imager_state_locked()
+        if IMAGER_STATE.get("current") is not None:
+            current = IMAGER_STATE.get("current") or {}
+            return jsonify({
+                "ok": False,
+                "error": "An imager run is already in progress.",
+                "error_code": "IMAGER_ALREADY_RUNNING",
+                "current_run_id": current.get("run_id"),
+            }), 409
+
+        try:
+            with log_path.open("w", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(IMAGER_ROOT),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+        except Exception as exc:
+            return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_SPAWN_FAILED"}), 500
+
+        job = {
+            "run_id": run_id,
+            "status": "running",
+            "variant": cfg.get("variant"),
+            "started_at": now_iso(),
+            "finished_at": None,
+            "exit_code": None,
+            "pid": process.pid,
+            "log_path": str(log_path),
+            "source_path": cfg["source_path"],
+            "target_path": cfg["target_path"],
+            "output_path": cfg["output_path"],
+            "command": command,
+            "config": cfg,
+            "process": process,
+        }
+        IMAGER_STATE["current"] = job
+
+    return jsonify({
+        "ok": True,
+        "run_id": run_id,
+        "status": "running",
+        "output_path": cfg["output_path"],
+        "log_path": str(log_path),
+        "started_at": now_iso(),
+        "command": command,
+    }), 202
+
+
+@app.route("/api/imager/stop", methods=["POST"])
+def api_imager_stop():
+    with IMAGER_STATE_LOCK:
+        _refresh_imager_state_locked()
+        current = IMAGER_STATE.get("current")
+        if not current:
+            return jsonify({"ok": False, "error": "No imager run is active.", "error_code": "IMAGER_NOT_RUNNING"}), 400
+
+        process: subprocess.Popen[str] | None = current.get("process")
+        if process is None:
+            return jsonify({"ok": False, "error": "No live process found for current run.", "error_code": "IMAGER_PROCESS_MISSING"}), 400
+
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=8)
+            except Exception:
+                process.kill()
+                process.wait(timeout=5)
+            exit_code = process.returncode
+        except Exception as exc:
+            return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_STOP_FAILED"}), 500
+
+        current["status"] = "stopped"
+        current["exit_code"] = exit_code
+        current["finished_at"] = now_iso()
+        current.pop("process", None)
+        IMAGER_STATE["last"] = current
+        IMAGER_STATE["current"] = None
+        return jsonify({"ok": True, "status": "stopped", "run_id": current.get("run_id"), "exit_code": exit_code, "finished_at": current.get("finished_at")})
+
+
+@app.route("/api/imager/logs")
+def api_imager_logs():
+    max_bytes = 20000
+    with IMAGER_STATE_LOCK:
+        _refresh_imager_state_locked()
+        current = IMAGER_STATE.get("current")
+        last = IMAGER_STATE.get("last")
+
+        run_id = str(request.args.get("run_id") or "").strip()
+        selected = None
+        for candidate in [current, last]:
+            if not candidate:
+                continue
+            if not run_id or str(candidate.get("run_id")) == run_id:
+                selected = candidate
+                break
+
+    if not selected:
+        return jsonify({"ok": False, "error": "No run logs available.", "error_code": "IMAGER_LOG_NOT_FOUND"}), 404
+
+    log_path = Path(str(selected.get("log_path") or ""))
+    if not log_path.exists() or not log_path.is_file():
+        return jsonify({"ok": False, "error": f"Log file not found: {log_path}", "error_code": "IMAGER_LOG_FILE_MISSING"}), 404
+
+    try:
+        raw = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_LOG_READ_FAILED"}), 500
+
+    clipped = raw[-max_bytes:]
+    return jsonify({
+        "ok": True,
+        "run_id": selected.get("run_id"),
+        "status": selected.get("status"),
+        "log_path": str(log_path),
+        "truncated": len(raw) > len(clipped),
+        "output": clipped,
+    })
+
+
+@app.route("/api/imager/debug", methods=["POST"])
+def api_imager_debug():
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "").strip().lower()
+    source_path = str(Path(str(body.get("source_path") or IMAGER_SOURCE_DEFAULT)).expanduser())
+    target_path = str(Path(str(body.get("target_path") or IMAGER_TARGET_DEFAULT)).expanduser())
+
+    if action == "verify_inputs":
+        result = _run_imager_debug_command(["file", source_path, target_path], timeout=20)
+        result["action"] = action
+        return jsonify(result)
+    if action == "help":
+        result = _run_imager_debug_command([str(IMAGER_PYTHON), str(IMAGER_SCRIPT), "headless-run", "--help"], timeout=45)
+        result["action"] = action
+        return jsonify(result)
+    if action == "list_outputs":
+        outputs = []
+        for path in sorted(IMAGER_ROOT.glob("*.mp4")):
+            try:
+                stat_res = path.stat()
+                outputs.append({"path": str(path), "size_bytes": stat_res.st_size, "modified_at": datetime.fromtimestamp(stat_res.st_mtime, tz=timezone.utc).isoformat()})
+            except Exception:
+                continue
+        return jsonify({"ok": True, "action": action, "outputs": outputs, "count": len(outputs), "ran_at": now_iso()})
+    if action == "providers":
+        code = "import onnxruntime as ort; print(ort.get_available_providers())"
+        result = _run_imager_debug_command([str(IMAGER_PYTHON), "-c", code], timeout=30)
+        result["action"] = action
+        return jsonify(result)
+    if action == "rocm_smi":
+        result = _run_imager_debug_command(["rocm-smi"], timeout=20)
+        result["action"] = action
+        return jsonify(result)
+
+    return jsonify({"ok": False, "error": "Unsupported debug action.", "error_code": "IMAGER_DEBUG_UNSUPPORTED_ACTION"}), 400
 
 
 if __name__ == "__main__":

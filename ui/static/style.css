@@ -289,6 +289,25 @@ li { margin-bottom: 8px; }
   margin-top: 10px;
 }
 
+.status-grid input[type="text"],
+.status-grid input[type="number"],
+.status-grid select {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid #94a3b8;
+  border-radius: 8px;
+}
+
+.status-grid .factset-actions input[type="number"] {
+  width: 90px;
+}
+
+#targetUrl {
+  min-width: 320px;
+  flex: 1;
+}
+
 #factsetConfigPath,
 #factsetConfigUpload {
   width: 100%;

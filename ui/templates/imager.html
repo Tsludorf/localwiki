@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FaceFusion Imager</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="topbar">
+      <div>
+        <h1>FaceFusion Imager</h1>
+        <p class="subtitle">Direct endpoint for local FaceFusion headless face-swap runs.</p>
+      </div>
+    </header>
+
+    <section class="overall good">
+      <h2>Run Configuration</h2>
+      <p class="help">Root: <code>{{ facefusion_root }}</code></p>
+      <div class="factset-sdk-toolbar">
+        <label><strong>Variant:</strong></label>
+        <select id="variant">
+          <option value="baseline">Baseline (tuned)</option>
+          <option value="stable">Variant A - Stable</option>
+          <option value="enhanced">Variant B - Enhanced</option>
+          <option value="padding60">Variant C - Padding 60</option>
+          <option value="migraphx">Variant D - MIGraphX</option>
+        </select>
+        <button id="runBtn">Run FaceFusion</button>
+        <button id="stopBtn" class="secondary">Stop Active Run</button>
+        <button id="refreshBtn" class="secondary">Refresh Status</button>
+      </div>
+
+      <div class="status-grid">
+        <div><strong>Source image</strong></div>
+        <div><input id="sourcePath" type="text" value="{{ source_default }}" /></div>
+        <div><strong>Target video</strong></div>
+        <div>
+          <input id="targetPath" type="text" value="{{ target_default }}" />
+          <div class="factset-actions" style="margin-top:8px;">
+            <input id="targetLocalFile" type="file" accept="video/*,.mp4,.mov,.m4v,.mkv,.webm,.avi" style="display:none;" />
+            <button id="browseTargetBtn" class="secondary" type="button">Browse local video</button>
+            <input id="targetUrl" type="text" placeholder="https://... direct video URL (e.g. instagram CDN mp4 link)" />
+            <button id="downloadTargetBtn" class="secondary" type="button">Download URL</button>
+          </div>
+          <p class="help">Target acquisition limit: 50MB. URL must resolve to a direct video file.</p>
+          <pre id="targetAcquireOutput">No target upload/download action yet.</pre>
+        </div>
+        <div><strong>Instagram auth</strong></div>
+        <div>
+          <div class="factset-actions">
+            <input id="cookiesFile" type="file" accept=".txt,text/plain" style="display:none;" />
+            <button id="uploadCookiesBtn" class="secondary" type="button">Upload cookies.txt</button>
+            <button id="clearCookiesBtn" class="secondary" type="button">Clear cookies</button>
+          </div>
+          <p class="help">Use browser-exported Netscape cookies.txt when Instagram URLs are login-gated.</p>
+          <pre id="cookiesOutput">No cookies action yet.</pre>
+        </div>
+        <div><strong>Output video</strong></div>
+        <div><input id="outputPath" type="text" value="{{ output_default }}" /></div>
+        <div><strong>Execution provider</strong></div>
+        <div>
+          <select id="executionProvider">
+            <option value="cpu">cpu</option>
+            <option value="migraphx">migraphx</option>
+            <option value="rocm">rocm</option>
+          </select>
+        </div>
+        <div><strong>Processors</strong></div>
+        <div class="factset-actions">
+          <label class="check-inline"><input id="processorSwapper" type="checkbox" checked /> face_swapper</label>
+          <label class="check-inline"><input id="processorEnhancer" type="checkbox" /> face_enhancer</label>
+        </div>
+        <div><strong>Mask padding</strong></div>
+        <div class="factset-actions">
+          <input id="padTop" type="number" min="0" max="120" value="40" />
+          <input id="padRight" type="number" min="0" max="120" value="40" />
+          <input id="padBottom" type="number" min="0" max="120" value="40" />
+          <input id="padLeft" type="number" min="0" max="120" value="40" />
+        </div>
+        <div><strong>Output quality</strong></div>
+        <div><input id="videoQuality" type="number" min="1" max="100" value="90" /></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Run Status</h2>
+      <pre id="runStatus">Loading status...</pre>
+    </section>
+
+    <section>
+      <h2>Runtime Log</h2>
+      <div class="factset-actions">
+        <button id="logsBtn" class="secondary">Load Logs</button>
+      </div>
+      <pre id="runLogs">No logs loaded.</pre>
+    </section>
+
+    <section>
+      <h2>Debug / Inspection</h2>
+      <div class="factset-actions">
+        <button class="secondary dbg-btn" data-action="verify_inputs">Verify inputs (file)</button>
+        <button class="secondary dbg-btn" data-action="help">FaceFusion --help</button>
+        <button class="secondary dbg-btn" data-action="list_outputs">List output MP4 files</button>
+        <button class="secondary dbg-btn" data-action="providers">ONNX providers</button>
+        <button class="secondary dbg-btn" data-action="rocm_smi">ROCm SMI snapshot</button>
+      </div>
+      <pre id="debugOutput">No debug command run yet.</pre>
+    </section>
+  </main>
+
+<script>
+const variantEl = document.getElementById('variant');
+const sourcePathEl = document.getElementById('sourcePath');
+const targetPathEl = document.getElementById('targetPath');
+const targetLocalFileEl = document.getElementById('targetLocalFile');
+const browseTargetBtn = document.getElementById('browseTargetBtn');
+const targetUrlEl = document.getElementById('targetUrl');
+const downloadTargetBtn = document.getElementById('downloadTargetBtn');
+const targetAcquireOutputEl = document.getElementById('targetAcquireOutput');
+const cookiesFileEl = document.getElementById('cookiesFile');
+const uploadCookiesBtn = document.getElementById('uploadCookiesBtn');
+const clearCookiesBtn = document.getElementById('clearCookiesBtn');
+const cookiesOutputEl = document.getElementById('cookiesOutput');
+const outputPathEl = document.getElementById('outputPath');
+const executionProviderEl = document.getElementById('executionProvider');
+const processorSwapperEl = document.getElementById('processorSwapper');
+const processorEnhancerEl = document.getElementById('processorEnhancer');
+const padTopEl = document.getElementById('padTop');
+const padRightEl = document.getElementById('padRight');
+const padBottomEl = document.getElementById('padBottom');
+const padLeftEl = document.getElementById('padLeft');
+const videoQualityEl = document.getElementById('videoQuality');
+const runBtn = document.getElementById('runBtn');
+const stopBtn = document.getElementById('stopBtn');
+const refreshBtn = document.getElementById('refreshBtn');
+const logsBtn = document.getElementById('logsBtn');
+const runStatusEl = document.getElementById('runStatus');
+const runLogsEl = document.getElementById('runLogs');
+const debugOutputEl = document.getElementById('debugOutput');
+
+let latestStatus = null;
+
+function fmt(v) {
+  return JSON.stringify(v, null, 2);
+}
+
+function toInt(inputEl, fallback) {
+  const n = Number(inputEl.value);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function selectedProcessors() {
+  const out = [];
+  if (processorSwapperEl.checked) out.push('face_swapper');
+  if (processorEnhancerEl.checked) out.push('face_enhancer');
+  return out;
+}
+
+function buildRunPayload() {
+  return {
+    variant: variantEl.value,
+    source_path: sourcePathEl.value.trim(),
+    target_path: targetPathEl.value.trim(),
+    output_path: outputPathEl.value.trim(),
+    execution_provider: executionProviderEl.value,
+    face_selector_mode: 'one',
+    face_selector_order: 'best-worst',
+    face_mask_types: ['box', 'occlusion'],
+    face_mask_padding: [
+      toInt(padTopEl, 40),
+      toInt(padRightEl, 40),
+      toInt(padBottomEl, 40),
+      toInt(padLeftEl, 40),
+    ],
+    processors: selectedProcessors(),
+    face_swapper_model: 'inswapper_128_fp16',
+    face_enhancer_model: 'gfpgan_1.4',
+    output_video_quality: toInt(videoQualityEl, 90),
+  };
+}
+
+function renderStatus(data) {
+  latestStatus = data;
+  const lines = [
+    `Checked: ${data.checked_at || 'n/a'}`,
+    `FaceFusion root: ${data.facefusion_root}`,
+    `Python exists: ${data.python_exists}`,
+    `Script exists: ${data.script_exists}`,
+    `Default source exists: ${data.source_exists}`,
+    `Default target exists: ${data.target_exists}`,
+    `Instagram cookies present: ${data.cookies_exists}`,
+    `Instagram cookies size: ${data.cookies_size_bytes ?? 'n/a'} bytes`,
+    '',
+    'Current run',
+    '-----------',
+    fmt(data.current),
+    '',
+    'Last run',
+    '--------',
+    fmt(data.last),
+  ];
+  runStatusEl.textContent = lines.join('\n');
+}
+
+async function uploadCookies(file) {
+  if (!file) {
+    cookiesOutputEl.textContent = 'No cookies file selected.';
+    return;
+  }
+  cookiesOutputEl.textContent = `Uploading cookies file: ${file.name}...`;
+  const form = new FormData();
+  form.append('cookies_file', file);
+  try {
+    const res = await fetch('/api/imager/cookies/upload', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json();
+    cookiesOutputEl.textContent = fmt(data);
+    await refreshStatus();
+  } catch (err) {
+    cookiesOutputEl.textContent = `Cookies upload failed: ${err}`;
+  }
+}
+
+async function clearCookies() {
+  cookiesOutputEl.textContent = 'Clearing cookies...';
+  try {
+    const res = await fetch('/api/imager/cookies/clear', { method: 'POST' });
+    const data = await res.json();
+    cookiesOutputEl.textContent = fmt(data);
+    await refreshStatus();
+  } catch (err) {
+    cookiesOutputEl.textContent = `Cookies clear failed: ${err}`;
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const res = await fetch('/api/imager/status', { cache: 'no-store' });
+    const data = await res.json();
+    renderStatus(data);
+  } catch (err) {
+    runStatusEl.textContent = `Failed to load status: ${err}`;
+  }
+}
+
+async function runFaceFusion() {
+  runStatusEl.textContent = 'Starting FaceFusion run...';
+  try {
+    const res = await fetch('/api/imager/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildRunPayload()),
+    });
+    const data = await res.json();
+    runStatusEl.textContent = fmt(data);
+    await refreshStatus();
+  } catch (err) {
+    runStatusEl.textContent = `Run request failed: ${err}`;
+  }
+}
+
+async function uploadLocalTarget(file) {
+  if (!file) {
+    targetAcquireOutputEl.textContent = 'No file selected.';
+    return;
+  }
+  if (file.size > 50 * 1024 * 1024) {
+    targetAcquireOutputEl.textContent = 'File exceeds 50MB limit.';
+    return;
+  }
+
+  targetAcquireOutputEl.textContent = `Uploading ${file.name}...`;
+  const form = new FormData();
+  form.append('target_video', file);
+  try {
+    const res = await fetch('/api/imager/target/upload', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await res.json();
+    if (data.ok && data.target_path) {
+      targetPathEl.value = data.target_path;
+    }
+    targetAcquireOutputEl.textContent = fmt(data);
+  } catch (err) {
+    targetAcquireOutputEl.textContent = `Upload failed: ${err}`;
+  }
+}
+
+async function downloadTargetFromUrl() {
+  const url = (targetUrlEl.value || '').trim();
+  if (!url) {
+    targetAcquireOutputEl.textContent = 'Enter a URL first.';
+    return;
+  }
+  targetAcquireOutputEl.textContent = 'Downloading remote target video...';
+  try {
+    const res = await fetch('/api/imager/target/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (data.ok && data.target_path) {
+      targetPathEl.value = data.target_path;
+    }
+    targetAcquireOutputEl.textContent = fmt(data);
+  } catch (err) {
+    targetAcquireOutputEl.textContent = `Download failed: ${err}`;
+  }
+}
+
+async function stopFaceFusion() {
+  runStatusEl.textContent = 'Stopping active run...';
+  try {
+    const res = await fetch('/api/imager/stop', { method: 'POST' });
+    const data = await res.json();
+    runStatusEl.textContent = fmt(data);
+    await refreshStatus();
+  } catch (err) {
+    runStatusEl.textContent = `Stop request failed: ${err}`;
+  }
+}
+
+async function loadLogs() {
+  runLogsEl.textContent = 'Loading logs...';
+  try {
+    const runId = (latestStatus && latestStatus.current && latestStatus.current.run_id) || (latestStatus && latestStatus.last && latestStatus.last.run_id) || '';
+    const url = runId ? `/api/imager/logs?run_id=${encodeURIComponent(runId)}` : '/api/imager/logs';
+    const res = await fetch(url, { cache: 'no-store' });
+    const data = await res.json();
+    runLogsEl.textContent = data.ok ? String(data.output || '') : fmt(data);
+  } catch (err) {
+    runLogsEl.textContent = `Failed to load logs: ${err}`;
+  }
+}
+
+async function runDebug(action) {
+  debugOutputEl.textContent = `Running debug action: ${action}...`;
+  try {
+    const res = await fetch('/api/imager/debug', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action,
+        source_path: sourcePathEl.value.trim(),
+        target_path: targetPathEl.value.trim(),
+      }),
+    });
+    const data = await res.json();
+    debugOutputEl.textContent = fmt(data);
+  } catch (err) {
+    debugOutputEl.textContent = `Debug request failed: ${err}`;
+  }
+}
+
+runBtn.addEventListener('click', runFaceFusion);
+stopBtn.addEventListener('click', stopFaceFusion);
+refreshBtn.addEventListener('click', refreshStatus);
+logsBtn.addEventListener('click', loadLogs);
+browseTargetBtn.addEventListener('click', () => targetLocalFileEl.click());
+targetLocalFileEl.addEventListener('change', async () => {
+  const file = targetLocalFileEl.files && targetLocalFileEl.files[0];
+  await uploadLocalTarget(file || null);
+  targetLocalFileEl.value = '';
+});
+downloadTargetBtn.addEventListener('click', downloadTargetFromUrl);
+uploadCookiesBtn.addEventListener('click', () => cookiesFileEl.click());
+cookiesFileEl.addEventListener('change', async () => {
+  const file = cookiesFileEl.files && cookiesFileEl.files[0];
+  await uploadCookies(file || null);
+  cookiesFileEl.value = '';
+});
+clearCookiesBtn.addEventListener('click', clearCookies);
+document.querySelectorAll('.dbg-btn').forEach((btn) => {
+  btn.addEventListener('click', () => runDebug(btn.dataset.action));
+});
+
+refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>
