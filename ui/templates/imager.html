@@ -54,7 +54,16 @@
             <button id="uploadCookiesBtn" class="secondary" type="button">Upload cookies.txt</button>
             <button id="clearCookiesBtn" class="secondary" type="button">Clear cookies</button>
           </div>
-          <p class="help">Use browser-exported Netscape cookies.txt when Instagram URLs are login-gated.</p>
+          <p class="help">
+            Use browser-exported Netscape cookies.txt when Instagram URLs are login-gated.
+            <span class="cookie-help-tooltip" tabindex="0">
+              ?
+              <span class="cookie-help-tooltip-text">
+                How to get it: open Instagram in Chrome/Firefox, sign in, then use a cookie export extension that writes Netscape cookies.txt (for example "Get cookies.txt", "Cookie-Editor", "EditThisCookie").
+                Upload that file as-is.
+              </span>
+            </span>
+          </p>
           <pre id="cookiesOutput">No cookies action yet.</pre>
         </div>
         <div><strong>Output video</strong></div>

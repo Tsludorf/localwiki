@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import base64
+import html
 import importlib
 import importlib.metadata
 import importlib.util
 import ipaddress
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -267,6 +269,60 @@ def _imager_command_from_config(cfg: dict[str, Any]) -> list[str]:
     return cmd
 
 
+def _validate_netscape_cookie_file(content: str) -> tuple[bool, str | None]:
+    lines = [line for line in content.splitlines()]
+
+    has_header = False
+    has_cookie_lines = False
+    has_instagram_domain = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_cookie_line = False
+
+        if stripped.lower().startswith("#httponly_") and "\t" in stripped:
+            is_cookie_line = True
+            stripped = stripped[1:]
+
+        if stripped.startswith("#") and not is_cookie_line:
+            if "netscape" in stripped.lower():
+                has_header = True
+            continue
+
+        if stripped.startswith("#") and is_cookie_line:
+            stripped = stripped[len("#"):]
+
+        parts = stripped.split("\t")
+        if len(parts) < 7:
+            return False, "Cookies export line is not in Netscape tab-separated format."
+
+        # Keep first 7 columns per Netscape cookie spec and ignore optional extra
+        # fields if present.
+        if len(parts) > 7:
+            parts = parts[:7]
+
+        if any(p.strip() == "" for p in parts[:7]):
+            return False, "Cookies export line contains missing fields."
+
+        domain = parts[0].lower()
+        if "instagram.com" in domain:
+            has_instagram_domain = True
+        has_cookie_lines = True
+
+    if not has_header:
+        return False, "Cookies file header missing. Export as Netscape format (cookies.txt)."
+
+    if not has_cookie_lines:
+        return False, "Cookies file appears to contain no cookie rows."
+
+    if not has_instagram_domain:
+        return False, "No Instagram cookies found. Export cookies from Instagram in the Netscape format."
+
+    return True, None
+
+
 def _refresh_imager_state_locked() -> None:
     current = IMAGER_STATE.get("current")
     if not current:
@@ -386,6 +442,182 @@ def _detect_extension_from_content_type(content_type: str | None) -> str:
     return ".mp4"
 
 
+def _extract_public_instagram_video_url(source_url: str) -> str | None:
+    candidates = [source_url]
+    if source_url.endswith("/"):
+        base = source_url[:-1]
+    else:
+        base = source_url
+    candidates.append(f"{base}/embed/")
+    candidates.append(f"{base}/embed?__a=1")
+    candidates.append(f"{base}/?__a=1&__d=dis")
+
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    }
+
+    patterns = [
+        re.compile(r'<meta property="og:video" content="([^"]+)"', re.IGNORECASE),
+        re.compile(r'<meta property="og:video:secure_url" content="([^"]+)"', re.IGNORECASE),
+        re.compile(r'<meta property="og:video:url" content="([^"]+)"', re.IGNORECASE),
+        re.compile(r'"video_url"\s*:\s*"([^"]+)"', re.IGNORECASE),
+        re.compile(r'"playback_url"\s*:\s*"([^"]+)"', re.IGNORECASE),
+        re.compile(r'"video_url"\s*:\s*"([^\"]+\.mp4[^\"]*)"', re.IGNORECASE),
+        re.compile(r'"display_url"\s*:\s*"([^\"]+\.(?:mp4|m3u8)[^\"]*)"', re.IGNORECASE),
+        re.compile(r'"playback"\s*:\s*"([^"]+?)"', re.IGNORECASE),
+        re.compile(r'"video_versions"\s*:\s*\[[^\]]*?"url"\s*:\s*"([^\"]+)"', re.IGNORECASE | re.DOTALL),
+    ]
+
+    for candidate_url in candidates:
+        try:
+            response = requests.get(candidate_url, headers=request_headers, timeout=(8, 20), allow_redirects=True)
+        except requests.RequestException:
+            continue
+
+        try:
+            status_code = response.status_code
+            if status_code < 200 or status_code >= 400:
+                continue
+
+            body = html.unescape(response.text or "")
+            for pattern in patterns:
+                match = pattern.search(body)
+                if not match:
+                    continue
+                url = html.unescape((match.group(1) or "").strip()).replace("\\/", "/")
+                if url and _looks_like_video_url(url):
+                    return url
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    return None
+
+
+def _looks_like_video_url(candidate: str) -> bool:
+    lowered = candidate.lower()
+    if not lowered:
+        return False
+    if lowered.startswith("//"):
+        candidate = f"https:{candidate}"
+    if not (candidate.startswith("http://") or candidate.startswith("https://")):
+        return False
+    parsed = urlparse(candidate)
+    if not parsed.hostname:
+        return False
+    path = (parsed.path or "").lower()
+    if any(ext in path for ext in [".mp4", ".m3u8", ".webm", ".mov", ".mkv", ".avi"]):
+        return True
+
+    query = (parsed.query or "").lower()
+    if any(token in query for token in ("mime_type=video/", "mime_type=video%2f", "format=mp4", "format=webm", "filetype=video")):
+        return True
+
+    hostname = parsed.hostname.lower()
+    return any(token in hostname for token in ("fbcdn.net", "cdninstagram"))
+
+
+def _download_public_instagram_video(video_url: str) -> tuple[Path | None, dict[str, Any] | None]:
+    is_public, host_error = _is_public_http_host(urlparse(video_url).hostname or "")
+    if not is_public:
+        return None, {
+            "ok": False,
+            "error": host_error or "Instagram direct media URL host is not allowed.",
+            "error_code": "IMAGER_TARGET_URL_BLOCKED",
+            "source_url": video_url,
+        }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+
+    try:
+        response = requests.get(video_url, headers=headers, stream=True, timeout=(10, 180), allow_redirects=True)
+    except requests.RequestException as exc:
+        return None, {"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED", "source_url": video_url}
+
+    try:
+        with response:
+            status_code = response.status_code
+            if status_code in {301, 302, 303, 307, 308}:
+                return None, {
+                    "ok": False,
+                    "error": "Instagram media URL is a redirect-only response.",
+                    "error_code": "IMAGER_TARGET_DOWNLOAD_HTTP_ERROR",
+                    "status_code": status_code,
+                }
+
+            if status_code >= 400:
+                return None, {
+                    "ok": False,
+                    "error": f"Instagram media download failed with HTTP {status_code}.",
+                    "error_code": "IMAGER_TARGET_DOWNLOAD_HTTP_ERROR",
+                    "status_code": status_code,
+                }
+
+            final_url = str(response.url or video_url)
+            final_parsed = urlparse(final_url)
+            hinted_name = Path(final_parsed.path).name or "instagram-video"
+            content_type = str(response.headers.get("content-type") or "")
+            content_length_header = response.headers.get("content-length")
+
+            if content_length_header:
+                try:
+                    expected_size = int(content_length_header)
+                except Exception:
+                    expected_size = None
+                else:
+                    if expected_size > IMAGER_TARGET_MAX_BYTES:
+                        return None, {
+                            "ok": False,
+                            "error": "Instagram media exceeds 50MB limit.",
+                            "error_code": "IMAGER_TARGET_TOO_LARGE",
+                        }
+
+            raw_ext = Path(hinted_name).suffix.lower()
+            is_video_content_type = str(content_type).lower().startswith("video/")
+            if not is_video_content_type and raw_ext.lower() not in IMAGER_ALLOWED_VIDEO_EXTENSIONS:
+                return None, {
+                    "ok": False,
+                    "error": "Instagram media response is not a video content type.",
+                    "error_code": "IMAGER_TARGET_URL_NOT_VIDEO",
+                    "content_type": content_type,
+                    "source_url": video_url,
+                }
+
+            ext = raw_ext if raw_ext in IMAGER_ALLOWED_VIDEO_EXTENSIONS else _detect_extension_from_content_type(content_type)
+            out_name = _ensure_video_filename(f"downloaded-{int(time.time())}-instagram", ext)
+            output_path = IMAGER_INPUT_DIR / out_name
+
+            total = 0
+            IMAGER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+            with output_path.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > IMAGER_TARGET_MAX_BYTES:
+                        try:
+                            output_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return None, {
+                            "ok": False,
+                            "error": "Instagram media exceeds 50MB limit.",
+                            "error_code": "IMAGER_TARGET_TOO_LARGE",
+                        }
+                    handle.write(chunk)
+
+            return output_path, None
+    except Exception as exc:
+        return None, {"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED", "source_url": video_url}
+
+
 def _is_public_http_host(hostname: str) -> tuple[bool, str | None]:
     host = str(hostname or "").strip().lower()
     if not host:
@@ -475,6 +707,13 @@ def _download_with_extractor(source_url: str) -> tuple[Path | None, dict[str, An
         combined = clip_text(result.stderr or result.stdout or "Extractor failed.", 4000)
         lowered = combined.lower()
         if ("login required" in lowered or "rate-limit reached" in lowered or "requested content is not available" in lowered) and not using_cookies:
+            public_video_url = _extract_public_instagram_video_url(source_url)
+            if public_video_url:
+                public_path, public_error = _download_public_instagram_video(public_video_url)
+                if public_path is not None:
+                    return public_path, None
+                if isinstance(public_error, dict):
+                    return None, public_error
             return None, {
                 "ok": False,
                 "error": "Instagram requires authenticated cookies for this URL. Upload a cookies.txt export and retry.",
@@ -2023,10 +2262,9 @@ def api_imager_cookies_upload():
     except Exception:
         return jsonify({"ok": False, "error": "Cookies file must be UTF-8 text.", "error_code": "IMAGER_COOKIES_INVALID_ENCODING"}), 400
 
-    # Simple Netscape cookies format sanity check.
-    lowered = content.lower()
-    if "instagram.com" not in lowered and "# netscape http cookie file" not in lowered:
-        return jsonify({"ok": False, "error": "Uploaded cookies file does not look like a browser cookie export.", "error_code": "IMAGER_COOKIES_INVALID_FORMAT"}), 400
+    valid_cookies, validation_error = _validate_netscape_cookie_file(content)
+    if not valid_cookies:
+        return jsonify({"ok": False, "error": validation_error, "error_code": "IMAGER_COOKIES_INVALID_FORMAT"}), 400
 
     IMAGER_COOKIES_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(IMAGER_COOKIES_DIR, stat.S_IRWXU)
@@ -2129,6 +2367,8 @@ def api_imager_target_download():
             elif error_code in {"IMAGER_EXTRACTOR_AUTH_REQUIRED", "IMAGER_EXTRACTOR_AUTH_FAILED"}:
                 status = 401
             elif error_code == "IMAGER_EXTRACTOR_MISSING":
+                status = 400
+            elif error_code == "IMAGER_TARGET_URL_BLOCKED":
                 status = 400
             else:
                 status = 502
