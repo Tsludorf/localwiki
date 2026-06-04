@@ -3437,20 +3437,22 @@ def api_imager_stop():
         if not current:
             return jsonify({"ok": False, "error": "No imager run is active.", "error_code": "IMAGER_NOT_RUNNING"}), 400
 
-        batch_items = current.get("batch_items")
-        if batch_items:
-            current["stop_requested"] = True
+        is_batch_job = bool(current.get("batch_items"))
+        current["stop_requested"] = True
 
         process: subprocess.Popen[str] | None = current.get("process")
         if process is None:
-            current["status"] = "stopped"
-            current["exit_code"] = 0
-            current["stop_requested"] = True
-            current["finished_at"] = now_iso()
+            if is_batch_job:
+                current["status"] = "stopping"
+            else:
+                current["status"] = "stopped"
+                current["exit_code"] = 0
+                current["finished_at"] = now_iso()
             current.pop("process", None)
             IMAGER_STATE["last"] = current
-            IMAGER_STATE["current"] = None
-            return jsonify({"ok": True, "status": "stopped", "run_id": current.get("run_id"), "exit_code": 0, "finished_at": current.get("finished_at")})
+            if not is_batch_job:
+                IMAGER_STATE["current"] = None
+            return jsonify({"ok": True, "status": "stopped", "run_id": current.get("run_id"), "exit_code": current.get("exit_code") or 0, "finished_at": current.get("finished_at")})
 
         current["status"] = "stopping"
         current["stop_requested"] = True
