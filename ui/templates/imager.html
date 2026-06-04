@@ -15,123 +15,161 @@
       </div>
     </header>
 
-    <section class="overall good">
-      <h2>Run Configuration</h2>
-      <p class="help">Root: <code>{{ facefusion_root }}</code></p>
-      <div class="factset-sdk-toolbar">
-        <label><strong>Variant:</strong></label>
-        <select id="variant">
-          <option value="baseline">Baseline (tuned)</option>
-          <option value="stable">Variant A - Stable</option>
-          <option value="enhanced">Variant B - Enhanced</option>
-          <option value="padding60">Variant C - Padding 60</option>
-          <option value="migraphx">Variant D - MIGraphX</option>
-        </select>
-        <button id="runBtn">Run FaceFusion</button>
-        <button id="stopBtn" class="secondary">Stop Active Run</button>
-        <button id="refreshBtn" class="secondary">Refresh Status</button>
-      </div>
+    <nav class="tabs" aria-label="Imager tabs">
+      <button class="tab active" data-imager-tab-target="imagerRunTab">Run</button>
+      <button class="tab" data-imager-tab-target="imagerWebscraperTab">Webscraper</button>
+    </nav>
 
-      <div class="status-grid">
-        <div><strong>Source image</strong></div>
-        <div>
-          <input id="sourcePath" type="text" value="{{ source_default }}" />
-          <div class="factset-actions" style="margin-top:8px;">
-            <input id="sourceLocalFile" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tiff" style="display:none;" />
-            <button id="browseSourceBtn" class="secondary" type="button">Browse local image</button>
-          </div>
-          <p class="help">Source image acquisition limit: 10MB.</p>
-          <pre id="sourceAcquireOutput">No source upload action yet.</pre>
-        </div>
-        <div><strong>Target video</strong></div>
-        <div>
-          <input id="targetPath" type="text" value="{{ target_default }}" />
-          <div class="factset-actions" style="margin-top:8px;">
-            <input id="targetLocalFile" type="file" accept="video/*,.mp4,.mov,.m4v,.mkv,.webm,.avi" style="display:none;" />
-            <button id="browseTargetBtn" class="secondary" type="button">Browse local video</button>
-            <input id="targetUrl" type="text" placeholder='https://... or JSON array e.g. ["https://...", "https://..."]' />
-            <button id="downloadTargetBtn" class="secondary" type="button">Download URL</button>
-          </div>
-           <p class="help">Target acquisition limit: 50MB. URL must resolve to a direct video file. You can run batches by pasting a JSON array in the target URL field.</p>
-          <pre id="targetAcquireOutput">No target upload/download action yet.</pre>
-        </div>
-        <div><strong>Instagram auth</strong></div>
-        <div>
-          <div class="factset-actions">
-            <input id="cookiesFile" type="file" accept=".txt,text/plain" style="display:none;" />
-            <button id="uploadCookiesBtn" class="secondary" type="button">Upload cookies.txt</button>
-            <button id="clearCookiesBtn" class="secondary" type="button">Clear cookies</button>
-          </div>
-          <p class="help">
-            Use browser-exported Netscape cookies.txt when Instagram URLs are login-gated.
-            <span class="cookie-help-tooltip" tabindex="0">
-              ?
-              <span class="cookie-help-tooltip-text">
-                How to get it: open Instagram in Chrome/Firefox, sign in, then use a cookie export extension that writes Netscape cookies.txt (for example "Get cookies.txt", "Cookie-Editor", "EditThisCookie").
-                Upload that file as-is.
-              </span>
-            </span>
-          </p>
-          <pre id="cookiesOutput">No cookies action yet.</pre>
-        </div>
-        <div><strong>Output video</strong></div>
-        <div><input id="outputPath" type="text" value="{{ output_default }}" /></div>
-        <div><strong>Execution provider</strong></div>
-        <div>
-          <select id="executionProvider">
-            <option value="cpu">cpu</option>
-            <option value="migraphx">migraphx</option>
-            <option value="rocm">rocm</option>
+    <section id="imagerRunTab" class="imager-tab-panel tab-panel active">
+      <section class="overall good">
+        <h2>Run Configuration</h2>
+        <p class="help">Root: <code>{{ facefusion_root }}</code></p>
+        <div class="factset-sdk-toolbar">
+          <label><strong>Variant:</strong></label>
+          <select id="variant">
+            <option value="baseline">Baseline (tuned)</option>
+            <option value="stable">Variant A - Stable</option>
+            <option value="enhanced">Variant B - Enhanced</option>
+            <option value="padding60">Variant C - Padding 60</option>
+            <option value="migraphx">Variant D - MIGraphX</option>
           </select>
+          <button id="runBtn">Run FaceFusion</button>
+          <button id="stopBtn" class="secondary">Stop Active Run</button>
+          <button id="refreshBtn" class="secondary">Refresh Status</button>
         </div>
-        <div><strong>Processors</strong></div>
+
+        <div class="status-grid">
+          <div><strong>Source image</strong></div>
+          <div>
+            <input id="sourcePath" type="text" value="{{ source_default }}" />
+            <div class="factset-actions" style="margin-top:8px;">
+              <input id="sourceLocalFile" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tiff" style="display:none;" />
+              <button id="browseSourceBtn" class="secondary" type="button">Browse local image</button>
+            </div>
+            <p class="help">Source image acquisition limit: 10MB.</p>
+            <pre id="sourceAcquireOutput">No source upload action yet.</pre>
+          </div>
+          <div><strong>Target video</strong></div>
+          <div>
+            <input id="targetPath" type="text" value="{{ target_default }}" />
+            <div class="factset-actions" style="margin-top:8px;">
+              <input id="targetLocalFile" type="file" accept="video/*,.mp4,.mov,.m4v,.mkv,.webm,.avi" style="display:none;" />
+              <button id="browseTargetBtn" class="secondary" type="button">Browse local video</button>
+              <input id="targetUrl" type="text" placeholder='https://... or JSON array e.g. ["https://...", "https://..."]' />
+              <button id="downloadTargetBtn" class="secondary" type="button">Download URL</button>
+            </div>
+            <p class="help">Target acquisition limit: 50MB. URL must resolve to a direct video file. You can run batches by pasting a JSON array in the target URL field.</p>
+            <pre id="targetAcquireOutput">No target upload/download action yet.</pre>
+          </div>
+          <div><strong>Output video</strong></div>
+          <div><input id="outputPath" type="text" value="{{ output_default }}" /></div>
+          <div><strong>Execution provider</strong></div>
+          <div>
+            <select id="executionProvider">
+              <option value="cpu">cpu</option>
+              <option value="migraphx">migraphx</option>
+              <option value="rocm">rocm</option>
+            </select>
+          </div>
+          <div><strong>Processors</strong></div>
+          <div class="factset-actions">
+            <label class="check-inline"><input id="processorSwapper" type="checkbox" checked /> face_swapper</label>
+            <label class="check-inline"><input id="processorEnhancer" type="checkbox" /> face_enhancer</label>
+          </div>
+          <div><strong>Mask padding</strong></div>
+          <div class="factset-actions">
+            <input id="padTop" type="number" min="0" max="120" value="10" />
+            <input id="padRight" type="number" min="0" max="120" value="10" />
+            <input id="padBottom" type="number" min="0" max="120" value="10" />
+            <input id="padLeft" type="number" min="0" max="120" value="10" />
+          </div>
+          <div><strong>Output quality</strong></div>
+          <div><input id="videoQuality" type="number" min="1" max="100" value="90" /></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Run Status</h2>
+        <pre id="runStatus">Loading status...</pre>
+      </section>
+
+      <section>
+        <h2>Runtime Log</h2>
+        <p class="help">Runtime logs are now tailed while a run is active (latest 10 lines).</p>
+        <pre id="runLogs">Waiting for run output...</pre>
+      </section>
+
+      <section>
+        <h2>Failure Recovery Note</h2>
+        <div class="help">
+          If a run exits immediately after a brief progress line, check for a "step check failed" pattern in the logs. In that case, verify the guard points in
+          <code>facefusion/core.py</code> and <code>facefusion/content_analyser.py</code> were updated together.
+          If this happens again, keep the same pattern: make the failing pre-check return a conservative <code>True</code> path so the headless flow can continue while you investigate.
+        </div>
+      </section>
+
+      <section>
+        <h2>Debug / Inspection</h2>
         <div class="factset-actions">
-          <label class="check-inline"><input id="processorSwapper" type="checkbox" checked /> face_swapper</label>
-          <label class="check-inline"><input id="processorEnhancer" type="checkbox" /> face_enhancer</label>
+          <button class="secondary dbg-btn" data-action="verify_inputs">Verify inputs (file)</button>
+          <button class="secondary dbg-btn" data-action="help">FaceFusion --help</button>
+          <button class="secondary dbg-btn" data-action="list_outputs">List output MP4 files</button>
+          <button class="secondary dbg-btn" data-action="providers">ONNX providers</button>
+          <button class="secondary dbg-btn" data-action="rocm_smi">ROCm SMI snapshot</button>
         </div>
-        <div><strong>Mask padding</strong></div>
+        <pre id="debugOutput">No debug command run yet.</pre>
+      </section>
+    </section>
+
+    <section id="imagerWebscraperTab" class="imager-tab-panel tab-panel">
+      <section class="overall good">
+        <h2>Webscraper</h2>
+        <p class="help">Discover content from Instagram and feed reels directly into FaceFusion target batches.</p>
+      </section>
+
+      <section>
+        <h2>Instagram reels</h2>
+        <p class="help">Discover recent reels by Instagram username and push them directly into the target URL list for batch swaps.</p>
+        <div class="imager-reels-controls">
+          <div class="factset-actions">
+            <input id="reelUsername" type="text" placeholder="Instagram username or profile URL" />
+            <select id="reelOrder">
+              <option value="newest" selected>Newest</option>
+              <option value="oldest">Oldest</option>
+            </select>
+            <button id="discoverReelsBtn" class="secondary" type="button">Discover Reels</button>
+          </div>
+          <div class="factset-actions reel-number-row">
+            <label class="check-inline">Page <input id="reelPage" class="reel-number" type="number" min="1" value="1" /></label>
+            <label class="check-inline">Page size <input id="reelPageSize" class="reel-number" type="number" min="1" value="24" /></label>
+            <label class="check-inline">Max results <input id="reelMaxResults" class="reel-number" type="number" min="1" value="24" /></label>
+          </div>
+          <label class="check-inline"><input id="reelUseCache" type="checkbox" checked /> Use cached results when available</label>
+        </div>
+        <pre id="reelDiscoverOutput">No reel discovery yet.</pre>
+      </section>
+
+      <section>
+        <h2>Instagram auth</h2>
         <div class="factset-actions">
-          <input id="padTop" type="number" min="0" max="120" value="10" />
-          <input id="padRight" type="number" min="0" max="120" value="10" />
-          <input id="padBottom" type="number" min="0" max="120" value="10" />
-          <input id="padLeft" type="number" min="0" max="120" value="10" />
+          <input id="cookiesFile" type="file" accept=".txt,text/plain" style="display:none;" />
+          <button id="uploadCookiesBtn" class="secondary" type="button">Upload cookies.txt</button>
+          <button id="clearCookiesBtn" class="secondary" type="button">Clear cookies</button>
         </div>
-        <div><strong>Output quality</strong></div>
-        <div><input id="videoQuality" type="number" min="1" max="100" value="90" /></div>
-      </div>
+        <p class="help">
+          Use browser-exported Netscape cookies.txt when Instagram URLs are login-gated.
+          <span class="cookie-help-tooltip" tabindex="0">
+            ?
+            <span class="cookie-help-tooltip-text">
+              How to get it: open Instagram in Chrome/Firefox, sign in, then use a cookie export extension that writes Netscape cookies.txt (for example "Get cookies.txt", "Cookie-Editor", "EditThisCookie").
+              Upload that file as-is.
+            </span>
+          </span>
+        </p>
+        <pre id="cookiesOutput">No cookies action yet.</pre>
+      </section>
     </section>
 
-    <section>
-      <h2>Run Status</h2>
-      <pre id="runStatus">Loading status...</pre>
-    </section>
-
-    <section>
-      <h2>Runtime Log</h2>
-      <p class="help">Runtime logs are now tailed while a run is active (latest 10 lines).</p>
-      <pre id="runLogs">Waiting for run output...</pre>
-    </section>
-
-    <section>
-      <h2>Failure Recovery Note</h2>
-      <div class="help">
-        If a run exits immediately after a brief progress line, check for a "step check failed" pattern in the logs. In that case, verify the guard points in
-        <code>facefusion/core.py</code> and <code>facefusion/content_analyser.py</code> were updated together.
-        If this happens again, keep the same pattern: make the failing pre-check return a conservative <code>True</code> path so the headless flow can continue while you investigate.
-      </div>
-    </section>
-
-    <section>
-      <h2>Debug / Inspection</h2>
-      <div class="factset-actions">
-        <button class="secondary dbg-btn" data-action="verify_inputs">Verify inputs (file)</button>
-        <button class="secondary dbg-btn" data-action="help">FaceFusion --help</button>
-        <button class="secondary dbg-btn" data-action="list_outputs">List output MP4 files</button>
-        <button class="secondary dbg-btn" data-action="providers">ONNX providers</button>
-        <button class="secondary dbg-btn" data-action="rocm_smi">ROCm SMI snapshot</button>
-      </div>
-      <pre id="debugOutput">No debug command run yet.</pre>
-    </section>
   </main>
 
 <script>
@@ -146,6 +184,16 @@ const browseTargetBtn = document.getElementById('browseTargetBtn');
 const targetUrlEl = document.getElementById('targetUrl');
 const downloadTargetBtn = document.getElementById('downloadTargetBtn');
 const targetAcquireOutputEl = document.getElementById('targetAcquireOutput');
+const imagerTabButtons = document.querySelectorAll('[data-imager-tab-target]');
+const imagerTabPanels = document.querySelectorAll('.imager-tab-panel');
+const reelUsernameEl = document.getElementById('reelUsername');
+const reelPageEl = document.getElementById('reelPage');
+const reelPageSizeEl = document.getElementById('reelPageSize');
+const reelMaxResultsEl = document.getElementById('reelMaxResults');
+const reelOrderEl = document.getElementById('reelOrder');
+const reelUseCacheEl = document.getElementById('reelUseCache');
+const discoverReelsBtn = document.getElementById('discoverReelsBtn');
+const reelDiscoverOutputEl = document.getElementById('reelDiscoverOutput');
 const cookiesFileEl = document.getElementById('cookiesFile');
 const uploadCookiesBtn = document.getElementById('uploadCookiesBtn');
 const clearCookiesBtn = document.getElementById('clearCookiesBtn');
@@ -173,6 +221,13 @@ let lastShownLogRunId = null;
 let imagerLimits = {
   targetMaxBytes: 50 * 1024 * 1024,
   sourceMaxBytes: 10 * 1024 * 1024,
+};
+let imagerReelsDefaults = {
+  defaultPage: 1,
+  defaultPageSize: 24,
+  defaultMaxResults: 24,
+  maxPageSize: 24,
+  maxResults: 200,
 };
 
 function setRunButtonState({ running = false, label = 'Run FaceFusion' }) {
@@ -321,6 +376,78 @@ function parseJsonArrayText(raw) {
 function toInt(inputEl, fallback) {
   const n = Number(inputEl.value);
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function activateImagerTab(tabTarget) {
+  if (!imagerTabButtons.length || !imagerTabPanels.length) {
+    return;
+  }
+
+  const requested = String(tabTarget || 'imagerRunTab').trim();
+  const targetTab = requested === 'webscraper' ? 'imagerWebscraperTab'
+    : requested === 'run' ? 'imagerRunTab'
+    : requested;
+
+  let hasMatch = false;
+  imagerTabButtons.forEach((button) => {
+    const isActive = button.dataset.imagerTabTarget === targetTab;
+    button.classList.toggle('active', isActive);
+    if (isActive) {
+      hasMatch = true;
+    }
+  });
+
+  const finalTarget = hasMatch ? targetTab : 'imagerRunTab';
+  imagerTabPanels.forEach((panel) => {
+    panel.classList.toggle('active', panel.id === finalTarget);
+  });
+}
+
+function initImagerTabs() {
+  const tabParam = new URLSearchParams(window.location.search).get('tab');
+  activateImagerTab(tabParam);
+
+  imagerTabButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      activateImagerTab(button.dataset.imagerTabTarget);
+    });
+  });
+}
+
+function parseReelsDiscoveryPayload() {
+  const username = String(reelUsernameEl.value || '').trim();
+  if (!username) {
+    return { ok: false, error: 'Instagram username is required.' };
+  }
+
+  const page = Math.trunc(Number(reelPageEl.value));
+  const pageSize = Math.trunc(Number(reelPageSizeEl.value));
+  const maxResults = Math.trunc(Number(reelMaxResultsEl.value));
+
+  if (!Number.isFinite(page) || page < 1) {
+    return { ok: false, error: 'Page must be a positive integer.' };
+  }
+  if (!Number.isFinite(pageSize) || pageSize < 1 || pageSize > imagerReelsDefaults.maxPageSize) {
+    return { ok: false, error: `Page size must be between 1 and ${imagerReelsDefaults.maxPageSize}.` };
+  }
+  if (!Number.isFinite(maxResults) || maxResults < 1 || maxResults > imagerReelsDefaults.maxResults) {
+    return { ok: false, error: `Max results must be between 1 and ${imagerReelsDefaults.maxResults}.` };
+  }
+
+  const order = String(reelOrderEl.value || 'newest').trim().toLowerCase();
+  if (!['newest', 'oldest'].includes(order)) {
+    return { ok: false, error: 'Order must be newest or oldest.' };
+  }
+
+  return {
+    ok: true,
+    username,
+    page,
+    page_size: pageSize,
+    max_results: maxResults,
+    order,
+    use_cache: Boolean(reelUseCacheEl && reelUseCacheEl.checked),
+  };
 }
 
 function selectedProcessors() {
@@ -508,6 +635,31 @@ function renderStatus(data) {
   }
   if (Number.isFinite(sourceMaxBytes)) {
     imagerLimits.sourceMaxBytes = sourceMaxBytes;
+  }
+  const reelSettings = data && data.reels_discovery;
+  if (reelSettings) {
+    const defaultPage = Number(reelSettings.default_page);
+    const defaultPageSize = Number(reelSettings.default_page_size);
+    const defaultMaxResults = Number(reelSettings.default_max_results);
+    const maxPageSize = Number(reelSettings.max_page_size);
+    const maxResults = Number(reelSettings.max_results);
+
+    imagerReelsDefaults = {
+      defaultPage: Number.isFinite(defaultPage) ? defaultPage : imagerReelsDefaults.defaultPage,
+      defaultPageSize: Number.isFinite(defaultPageSize) ? defaultPageSize : imagerReelsDefaults.defaultPageSize,
+      defaultMaxResults: Number.isFinite(defaultMaxResults) ? defaultMaxResults : imagerReelsDefaults.defaultMaxResults,
+      maxPageSize: Number.isFinite(maxPageSize) ? maxPageSize : imagerReelsDefaults.maxPageSize,
+      maxResults: Number.isFinite(maxResults) ? maxResults : imagerReelsDefaults.maxResults,
+    };
+    if (!reelPageEl.value) {
+      reelPageEl.value = String(imagerReelsDefaults.defaultPage);
+    }
+    if (!reelPageSizeEl.value) {
+      reelPageSizeEl.value = String(imagerReelsDefaults.defaultPageSize);
+    }
+    if (!reelMaxResultsEl.value) {
+      reelMaxResultsEl.value = String(imagerReelsDefaults.defaultMaxResults);
+    }
   }
 
   const current = (data && data.current) || null;
@@ -721,6 +873,41 @@ async function downloadTargetFromUrl() {
   }
 }
 
+async function discoverReels() {
+  const parsed = parseReelsDiscoveryPayload();
+  if (!parsed.ok) {
+    reelDiscoverOutputEl.textContent = `Reel discovery failed: ${parsed.error}`;
+    return;
+  }
+
+  reelDiscoverOutputEl.textContent = 'Discovering Instagram reels...';
+  try {
+    const res = await fetch('/api/imager/reels/discover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: parsed.username,
+        page: parsed.page,
+        page_size: parsed.page_size,
+        max_results: parsed.max_results,
+        order: parsed.order,
+        use_cache: parsed.use_cache,
+      }),
+    });
+    const data = await readResponseJson(res);
+    if (!Array.isArray(data)) {
+      reelDiscoverOutputEl.textContent = fmt(data);
+      return;
+    }
+
+    const output = `Discovered ${data.length} reel${data.length === 1 ? '' : 's'}.`;
+    reelDiscoverOutputEl.textContent = `${output} Target URL field updated.`;
+    targetUrlEl.value = JSON.stringify(data);
+  } catch (err) {
+    reelDiscoverOutputEl.textContent = `Reel discovery failed: ${err}`;
+  }
+}
+
 async function stopFaceFusion() {
   runStatusEl.textContent = 'Stopping active run...';
   try {
@@ -773,6 +960,7 @@ targetLocalFileEl.addEventListener('change', async () => {
   targetLocalFileEl.value = '';
 });
 downloadTargetBtn.addEventListener('click', downloadTargetFromUrl);
+discoverReelsBtn.addEventListener('click', discoverReels);
 uploadCookiesBtn.addEventListener('click', () => cookiesFileEl.click());
 cookiesFileEl.addEventListener('change', async () => {
   const file = cookiesFileEl.files && cookiesFileEl.files[0];
@@ -784,6 +972,7 @@ document.querySelectorAll('.dbg-btn').forEach((btn) => {
   btn.addEventListener('click', () => runDebug(btn.dataset.action));
 });
 
+initImagerTabs();
 refreshStatus();
 setInterval(refreshStatus, 5000);
 </script>

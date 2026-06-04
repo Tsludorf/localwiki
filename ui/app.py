@@ -7,6 +7,7 @@ import html
 import importlib
 import importlib.metadata
 import importlib.util
+import hashlib
 import ipaddress
 import os
 import re
@@ -152,6 +153,13 @@ IMAGER_EXTRACTOR_HOSTS = {"instagram.com", "www.instagram.com", "instagr.am"}
 IMAGER_COOKIES_DIR = IMAGER_ROOT / "data" / "secrets" / "imager"
 IMAGER_COOKIES_PATH = IMAGER_COOKIES_DIR / "instagram-cookies.txt"
 IMAGER_COOKIES_MAX_BYTES = 2 * 1024 * 1024
+IMAGER_INSTAGRAM_REELS_DEFAULT_MAX_RESULTS = 24
+IMAGER_INSTAGRAM_REELS_MAX_RESULTS = 200
+IMAGER_INSTAGRAM_REELS_PAGE_SIZE = 24
+IMAGER_INSTAGRAM_REELS_RETRIES = 3
+IMAGER_INSTAGRAM_REELS_RETRY_DELAY_SECONDS = 1.0
+IMAGER_INSTAGRAM_REELS_CACHE_TTL_SECONDS = 15 * 60
+IMAGER_INSTAGRAM_REELS_CACHE_DIR = IMAGER_ROOT / "data" / "cache" / "imager_reels"
 IMAGER_STATE_LOCK = Lock()
 IMAGER_STATE: dict[str, Any] = {
     "current": None,
@@ -204,6 +212,35 @@ def _coerce_padding(value: Any) -> tuple[list[int] | None, str | None]:
     if any(v < 0 or v > 120 for v in parsed):
         return None, "face_mask_padding values must be between 0 and 120."
     return parsed, None
+
+
+def _coerce_int_range(value: Any, *, field: str, minimum: int, maximum: int | None, default: int) -> tuple[int, str | None]:
+    if value is None:
+        return default, None
+    try:
+        parsed = int(value)
+    except Exception:
+        return default, f"{field} must be an integer."
+    if parsed < minimum:
+        return default, f"{field} must be at least {minimum}."
+    if maximum is not None and parsed > maximum:
+        return default, f"{field} must be at most {maximum}."
+    return parsed, None
+
+
+def _coerce_bool(value: Any, *, field: str, default: bool) -> tuple[bool, str | None]:
+    if value is None:
+        return default, None
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, (int, float)):
+        return bool(value), None
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True, None
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False, None
+    return default, f"{field} must be a boolean."
 
 
 def _merge_imager_config(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -724,6 +761,338 @@ def _resolve_imager_targets(target_values: list[str]) -> tuple[list[str] | None,
     return resolved, None, None
 
 
+def _normalize_instagram_username(raw_username: Any) -> tuple[str | None, str | None]:
+    text = str(raw_username or "").strip()
+    if not text:
+        return None, "Instagram username is required."
+
+    if text.startswith("@"):
+        text = text[1:].strip()
+    if not text:
+        return None, "Instagram username is required."
+
+    host_candidates = ("instagram.com", "www.instagram.com", "instagr.am", "www.instagr.am")
+    username: str
+
+    if any(token in text.lower() for token in host_candidates):
+        parsed = urlparse(text if "://" in text else f"https://{text}")
+        host = (parsed.hostname or "").lower()
+        if not host or not any(host == token or host.endswith(f".{token}") for token in ("instagram.com", "instagr.am")):
+            return None, "Instagram URL must point to instagram.com or instagr.am."
+        path_segments = [segment for segment in (parsed.path or "").split("/") if segment]
+        if not path_segments:
+            return None, "Unable to parse Instagram username from URL."
+
+        username_candidate = path_segments[0].strip()
+        if not username_candidate:
+            return None, "Unable to parse Instagram username from URL."
+
+        if username_candidate.lower() in {"reels", "reel", "p", "tv", "explore", "users", "accounts"}:
+            if len(path_segments) < 2:
+                return None, "Unable to parse Instagram username from URL."
+            username_candidate = path_segments[1].strip()
+
+        if username_candidate.startswith("@"):  # support old shared copy quirks
+            username_candidate = username_candidate[1:].strip()
+
+        username = username_candidate
+    else:
+        username = text.split("/")[0].split("?")[0].split("#")[0].strip()
+        username = username.lstrip("@")
+
+    username = username.strip()
+    if not username:
+        return None, "Instagram username is required."
+
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        return None, "Invalid Instagram username format."
+
+    return username.lower(), None
+
+
+def _normalize_instagram_reel_url(raw_url: str) -> str | None:
+    text = str(raw_url or "").strip()
+    if not text:
+        return None
+
+    parsed = urlparse(text if "://" in text else f"https://{text}")
+    host = (parsed.hostname or "").lower()
+    if not host or not (host == "instagram.com" or host.endswith(".instagram.com") or host == "instagr.am" or host.endswith(".instagr.am")):
+        return None
+
+    segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    if len(segments) < 2:
+        return None
+
+    first = segments[0].lower()
+    if first not in {"p", "reel", "reels"}:
+        return None
+
+    shortcode = segments[1].strip()
+    if not shortcode:
+        return None
+
+    return f"https://www.instagram.com/p/{shortcode}/"
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _imager_reels_cache_path(username: str, *, page: int, page_size: int, max_results: int, order: str) -> Path:
+    key = f"{username}|{page}|{page_size}|{max_results}|{order}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return IMAGER_INSTAGRAM_REELS_CACHE_DIR / f"reels-{digest}.json"
+
+
+def _load_imager_reels_cache(cache_path: Path) -> list[str] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        raw = cache_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except Exception:
+        return None
+
+    created_at = payload.get("created_at")
+    urls = payload.get("urls")
+    if not isinstance(created_at, int | float) or not isinstance(urls, list):
+        return None
+
+    if (time.time() - float(created_at)) > IMAGER_INSTAGRAM_REELS_CACHE_TTL_SECONDS:
+        try:
+            cache_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+    cleaned_urls = [str(url) for url in urls if str(url).strip()]
+    return _dedupe_preserve_order(cleaned_urls)
+
+
+def _save_imager_reels_cache(cache_path: Path, urls: list[str], *, username: str, page: int, page_size: int, max_results: int, order: str) -> None:
+    cache_payload = {
+        "created_at": time.time(),
+        "username": username,
+        "page": page,
+        "page_size": page_size,
+        "max_results": max_results,
+        "order": order,
+        "urls": _dedupe_preserve_order(urls),
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _classify_instagram_reels_error(output: str, status_code: int | None = None) -> tuple[str, str, int]:
+    lowered = (str(output or "").lower())
+    if status_code == 404 or "not found" in lowered and ("user" in lowered or "account" in lowered or "profile" in lowered):
+        return (
+            "Instagram profile is unavailable or does not exist.",
+            "IMAGER_REELS_PROFILE_NOT_FOUND",
+            404,
+        )
+
+    if "private" in lowered or "this account is private" in lowered or "follow" in lowered and "account" in lowered:
+        return (
+            "Instagram profile is private.",
+            "IMAGER_REELS_PROFILE_PRIVATE",
+            403,
+        )
+
+    if "suspend" in lowered or "banned" in lowered or "disabled" in lowered or "blocked" in lowered:
+        return (
+            "Instagram profile is unavailable.",
+            "IMAGER_REELS_PROFILE_BANNED",
+            403,
+        )
+
+    if "rate" in lowered and "limit" in lowered or status_code == 429:
+        return (
+            "Instagram rate limit reached. Try again later.",
+            "IMAGER_REELS_RATE_LIMITED",
+            429,
+        )
+
+    if "login required" in lowered or "sign in" in lowered or "account requires" in lowered:
+        return (
+            "Instagram authentication is required for this profile.",
+            "IMAGER_REELS_AUTH_REQUIRED",
+            401,
+        )
+
+    if "tempor" in lowered and "unavailable" in lowered:
+        return (
+            "Instagram responded with a temporary error.",
+            "IMAGER_REELS_TEMPORARY_UNAVAILABLE",
+            503,
+        )
+
+    return (
+        "Instagram reel discovery failed.",
+        "IMAGER_REELS_DISCOVERY_FAILED",
+        502,
+    )
+
+
+def _discover_instagram_reels_with_ytdlp(
+    username: str,
+    *,
+    start: int,
+    end: int,
+    use_cache: bool = True,
+    order: str = "newest",
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    if start > end:
+        return [], None
+
+    ytdlp_bin = shutil.which("yt-dlp") or shutil.which("youtube-dl")
+    if not ytdlp_bin:
+        return None, {
+            "ok": False,
+            "error": "yt-dlp is not installed. Install yt-dlp to discover Instagram reels.",
+            "error_code": "IMAGER_REELS_DISCOVERY_TOOL_MISSING",
+            "status_code": 400,
+        }
+
+    profile_url = f"https://www.instagram.com/{username}/reels/"
+    base_cmd = [
+        ytdlp_bin,
+        "--flat-playlist",
+        "--no-progress",
+        "--no-warnings",
+        "--quiet",
+        "--playlist-start", str(start),
+        "--playlist-end", str(end),
+        "--print", "%(webpage_url)s",
+        profile_url,
+    ]
+    order_value = str(order or "").strip().lower()
+    if order_value == "oldest":
+        base_cmd.insert(-1, "--playlist-reverse")
+    if IMAGER_COOKIES_PATH.exists() and IMAGER_COOKIES_PATH.is_file():
+        base_cmd[3:3] = ["--cookies", str(IMAGER_COOKIES_PATH)]
+
+    retry_delay = float(IMAGER_INSTAGRAM_REELS_RETRY_DELAY_SECONDS)
+    last_error: dict[str, Any] | None = None
+
+    for attempt in range(1, IMAGER_INSTAGRAM_REELS_RETRIES + 1):
+        cmd = base_cmd.copy()
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                timeout=max(30, 12 * (end - start + 1)),
+                cwd=str(IMAGER_ROOT),
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_error = {
+                "ok": False,
+                "error": "Instagram reel discovery timed out.",
+                "error_code": "IMAGER_REELS_DISCOVERY_TIMEOUT",
+                "status_code": 504,
+                "error_detail": f"yt-dlp timeout while fetching profile reels: {type(exc).__name__}",
+            }
+            if attempt < IMAGER_INSTAGRAM_REELS_RETRIES:
+                time.sleep(retry_delay * attempt)
+                continue
+            return None, last_error
+        except Exception as exc:
+            return None, {
+                "ok": False,
+                "error": repr(exc),
+                "error_code": "IMAGER_REELS_DISCOVERY_FAILED",
+                "status_code": 502,
+                "error_detail": f"yt-dlp invocation failed: {type(exc).__name__}",
+            }
+
+        if result.returncode == 0:
+            lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            normalized = [_normalize_instagram_reel_url(line) for line in lines]
+            urls = _dedupe_preserve_order([value for value in normalized if value])
+            return urls, None
+
+        combined = result.stderr or result.stdout or ""
+        message, code, status_code = _classify_instagram_reels_error(combined, status_code=result.returncode)
+        if status_code == 401 and use_cache and not (IMAGER_COOKIES_PATH.exists() and IMAGER_COOKIES_PATH.is_file()):
+            message += " Upload Instagram cookies and retry."
+        # For deterministic failures, do not retry.
+        if code in {
+            "IMAGER_REELS_PROFILE_NOT_FOUND",
+            "IMAGER_REELS_PROFILE_PRIVATE",
+            "IMAGER_REELS_PROFILE_BANNED",
+            "IMAGER_REELS_DISCOVERY_TOOL_MISSING",
+        }:
+            return None, {
+                "ok": False,
+                "error": message,
+                "error_code": code,
+                "status_code": status_code,
+                "error_detail": clip_text(combined, 4000),
+            }
+
+        # Retries are useful for temporary failures (rate-limit, temporary outages, timeouts).
+        if code in {"IMAGER_REELS_RATE_LIMITED", "IMAGER_REELS_TEMPORARY_UNAVAILABLE"} and attempt < IMAGER_INSTAGRAM_REELS_RETRIES:
+            last_error = {
+                "ok": False,
+                "error": message,
+                "error_code": code,
+                "status_code": status_code,
+                "error_detail": clip_text(combined, 4000),
+            }
+            time.sleep(retry_delay * attempt)
+            continue
+
+        if status_code == 429 and attempt < IMAGER_INSTAGRAM_REELS_RETRIES:
+            last_error = {
+                "ok": False,
+                "error": message,
+                "error_code": code,
+                "status_code": status_code,
+                "error_detail": clip_text(combined, 4000),
+            }
+            time.sleep(retry_delay * attempt)
+            continue
+
+        if code in {"IMAGER_REELS_DISCOVERY_FAILED", "IMAGER_REELS_DISCOVERY_TIMEOUT"}:
+            last_error = {
+                "ok": False,
+                "error": "Instagram reel discovery failed.",
+                "error_code": "IMAGER_REELS_DISCOVERY_FAILED",
+                "status_code": status_code,
+                "error_detail": clip_text(combined, 4000),
+            }
+            # Return the last observed failure unless later attempts succeed.
+            if attempt < IMAGER_INSTAGRAM_REELS_RETRIES:
+                time.sleep(retry_delay * attempt)
+                continue
+            return None, last_error
+
+        # Fallback: no further retries.
+        return None, {
+            "ok": False,
+            "error": message,
+            "error_code": code,
+            "status_code": status_code,
+            "error_detail": clip_text(combined, 4000),
+        }
+
+    assert last_error is not None
+    return None, last_error
+
+
 def _run_imager_batch_job(batch_id: str, items: list[dict[str, Any]], cfg: dict[str, Any], initial_batch_start: str) -> None:
     completed = 0
     failures = 0
@@ -990,6 +1359,13 @@ def _imager_status_payload() -> dict[str, Any]:
             "cookies_path": str(IMAGER_COOKIES_PATH),
             "cookies_exists": cookies_exists,
             "cookies_size_bytes": cookies_size,
+            "reels_discovery": {
+                "default_page": 1,
+                "default_page_size": IMAGER_INSTAGRAM_REELS_PAGE_SIZE,
+                "default_max_results": IMAGER_INSTAGRAM_REELS_DEFAULT_MAX_RESULTS,
+                "max_page_size": IMAGER_INSTAGRAM_REELS_PAGE_SIZE,
+                "max_results": IMAGER_INSTAGRAM_REELS_MAX_RESULTS,
+            },
             "python_path": str(IMAGER_PYTHON),
             "script_path": str(IMAGER_SCRIPT),
             "python_exists": IMAGER_PYTHON.exists(),
@@ -3291,6 +3667,91 @@ def api_imager_target_download():
         "source_url": source_url,
         "message": "Downloaded target video is ready.",
     })
+
+
+@app.route("/api/imager/reels/discover", methods=["POST"])
+def api_imager_reels_discover():
+    try:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Request body must be a JSON object.", "error_code": "IMAGER_INVALID_BODY"}), 400
+
+        username_raw = body.get("username")
+        username, username_error = _normalize_instagram_username(username_raw)
+        if username_error:
+            return jsonify({"ok": False, "error": username_error, "error_code": "IMAGER_REELS_USERNAME_INVALID"}), 400
+
+        page, page_error = _coerce_int_range(body.get("page"), field="page", minimum=1, maximum=1_000_000, default=1)
+        if page_error:
+            return jsonify({"ok": False, "error": page_error, "error_code": "IMAGER_REELS_INVALID_PAGE"}), 400
+
+        page_size, page_size_error = _coerce_int_range(
+            body.get("page_size"),
+            field="page_size",
+            minimum=1,
+            maximum=IMAGER_INSTAGRAM_REELS_PAGE_SIZE,
+            default=IMAGER_INSTAGRAM_REELS_PAGE_SIZE,
+        )
+        if page_size_error:
+            return jsonify({"ok": False, "error": page_size_error, "error_code": "IMAGER_REELS_INVALID_PAGE_SIZE"}), 400
+
+        max_results, max_results_error = _coerce_int_range(
+            body.get("max_results"),
+            field="max_results",
+            minimum=1,
+            maximum=IMAGER_INSTAGRAM_REELS_MAX_RESULTS,
+            default=IMAGER_INSTAGRAM_REELS_DEFAULT_MAX_RESULTS,
+        )
+        if max_results_error:
+            return jsonify({"ok": False, "error": max_results_error, "error_code": "IMAGER_REELS_INVALID_MAX_RESULTS"}), 400
+
+        use_cache, use_cache_error = _coerce_bool(body.get("use_cache"), field="use_cache", default=True)
+        if use_cache_error:
+            return jsonify({"ok": False, "error": use_cache_error, "error_code": "IMAGER_REELS_INVALID_USE_CACHE"}), 400
+
+        order = str(body.get("order") or "newest").strip().lower()
+        if order not in {"newest", "oldest"}:
+            return jsonify({"ok": False, "error": "order must be either newest or oldest.", "error_code": "IMAGER_REELS_INVALID_ORDER"}), 400
+
+        start = (page - 1) * page_size + 1
+        end = start + page_size - 1
+        if max_results > 0:
+            end = min(end, max_results)
+
+        cache_path = _imager_reels_cache_path(username, page=page, page_size=page_size, max_results=max_results, order=order)
+        if use_cache:
+            cached_urls = _load_imager_reels_cache(cache_path)
+            if cached_urls is not None:
+                return jsonify(cached_urls)
+
+        if start > end:
+            urls = []
+            _save_imager_reels_cache(cache_path, urls, username=username, page=page, page_size=page_size, max_results=max_results, order=order)
+            return jsonify(urls)
+
+        urls, discovery_error = _discover_instagram_reels_with_ytdlp(
+            username,
+            start=start,
+            end=end,
+            use_cache=False,
+            order=order,
+        )
+        if discovery_error is not None:
+            status_code = int(discovery_error.get("status_code") or 502)
+            return jsonify(discovery_error), status_code
+
+        result_urls = _dedupe_preserve_order(urls or [])
+        _save_imager_reels_cache(cache_path, result_urls, username=username, page=page, page_size=page_size, max_results=max_results, order=order)
+
+        return jsonify(result_urls)
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "Unexpected error while discovering Instagram reels.",
+            "error_code": "IMAGER_REELS_DISCOVERY_INTERNAL_ERROR",
+            "exception": repr(exc),
+            "exception_type": type(exc).__name__,
+        }), 500
 
 
 @app.route("/api/imager/run", methods=["POST"])

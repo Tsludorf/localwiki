@@ -55,6 +55,12 @@ h1 { margin: 0; }
   border-radius: 8px;
   font-weight: 600;
 }
+
+.imager-nav-links {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
 button {
   background: #0f766e;
   color: white;
@@ -238,6 +244,54 @@ li { margin-bottom: 8px; }
   gap: 10px;
   flex-wrap: wrap;
   margin: 10px 0;
+}
+
+.imager-reels-controls {
+  margin-top: 6px;
+}
+
+.imager-reels-controls .factset-actions {
+  margin-top: 0;
+}
+
+.reel-number {
+  width: 86px;
+  text-align: right;
+  box-sizing: border-box;
+}
+
+.reel-number-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+#reelUsername,
+#reelOrder {
+  min-width: 180px;
+}
+
+#reelDiscoverOutput {
+  margin-top: 8px;
+  max-height: 180px;
+}
+
+@media (max-width: 760px) {
+  .reel-number-row {
+    gap: 8px;
+  }
+
+  .reel-number {
+    width: 110px;
+  }
+
+  #reelUsername,
+  #reelOrder {
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
+  }
 }
 
 .factset-sdk-toolbar {

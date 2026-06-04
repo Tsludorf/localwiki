@@ -477,3 +477,369 @@ def test_resolve_imager_targets_parses_embedded_array_before_resolving():
     finally:
         if os.path.exists(target_path):
             os.unlink(target_path)
+
+
+def _read_imager_template():
+    return (PROJECT_ROOT / "ui" / "templates" / "imager.html").read_text(encoding="utf-8")
+
+
+def test_imager_template_contains_reels_controls():
+    template = _read_imager_template()
+    assert 'id="reelUsername"' in template
+    assert 'id="reelPage"' in template
+    assert 'id="reelPageSize"' in template
+    assert 'id="reelMaxResults"' in template
+    assert 'id="reelOrder"' in template
+    assert 'id="reelUseCache"' in template
+    assert 'id="discoverReelsBtn"' in template
+    assert 'id="reelDiscoverOutput"' in template
+
+
+def test_imager_status_payload_exposes_reels_discovery_settings():
+    app_module = _load_imager_app_module_for_tests()
+    payload = app_module._imager_status_payload()
+    reel_settings = payload.get("reels_discovery")
+    assert isinstance(reel_settings, dict)
+    assert reel_settings.get("default_page") == 1
+    assert reel_settings.get("default_page_size") == app_module.IMAGER_INSTAGRAM_REELS_PAGE_SIZE
+    assert reel_settings.get("default_max_results") == app_module.IMAGER_INSTAGRAM_REELS_DEFAULT_MAX_RESULTS
+    assert reel_settings.get("max_page_size") == app_module.IMAGER_INSTAGRAM_REELS_PAGE_SIZE
+    assert reel_settings.get("max_results") == app_module.IMAGER_INSTAGRAM_REELS_MAX_RESULTS
+
+
+def test_imager_route_includes_reels_controls_in_rendered_html():
+    app_module = _load_imager_app_module_for_tests()
+    app = getattr(app_module, "app", None)
+    test_client = getattr(app, "test_client", None)
+    if not callable(test_client):
+        return
+
+    with test_client() as client:
+        response = client.get("/imager")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    assert 'id="reelUsername"' in html
+    assert 'id="discoverReelsBtn"' in html
+    assert '/api/imager/reels/discover' in html
+
+
+def test_ui_navigation_includes_imager_entry_on_landing_and_dashboard():
+    app_module = _load_imager_app_module_for_tests()
+    app = getattr(app_module, "app", None)
+    test_client = getattr(app, "test_client", None)
+    if not callable(test_client):
+        return
+
+    with test_client() as client:
+        landing_html = client.get("/").get_data(as_text=True)
+        dashboard_html = client.get("/dashboard").get_data(as_text=True)
+
+    assert 'href="/imager"' in landing_html
+    assert 'Open Imager Webscraper' in landing_html
+    assert 'href="/imager"' in dashboard_html
+    assert 'Open Imager Webscraper' in dashboard_html
+
+
+def _extract_json_response(response):
+    status_code = 200
+    payload = response
+    if isinstance(response, tuple):
+        payload = response[0]
+        if len(response) > 1 and response[1] is not None:
+            status_code = int(response[1])
+    elif hasattr(payload, "status_code"):
+        status_code = int(getattr(payload, "status_code") or 200)
+
+    if hasattr(payload, "get_json"):
+        json_payload = payload.get_json(silent=True)
+        if json_payload is not None:
+            payload = json_payload
+
+    return payload, status_code
+
+
+def _run_imager_reels_discover_with_body(app_module, body):
+    app = getattr(app_module, "app", None)
+    test_request_context = getattr(app, "test_request_context", None)
+    if callable(test_request_context):
+        with test_request_context("/api/imager/reels/discover", method="POST", json=body):
+            return app_module.api_imager_reels_discover()
+
+    original_request = app_module.request
+    app_module.request = types.SimpleNamespace(get_json=lambda **_: body)
+    try:
+        return app_module.api_imager_reels_discover()
+    finally:
+        app_module.request = original_request
+
+
+def test_coerce_int_range_bounds_and_types():
+    app_module = _load_imager_app_module_for_tests()
+
+    value, error = app_module._coerce_int_range("12", field="page", minimum=1, maximum=24, default=12)
+    assert value == 12
+    assert error is None
+
+    value, error = app_module._coerce_int_range("99", field="page", minimum=1, maximum=24, default=12)
+    assert value == 12
+    assert error == "page must be at most 24."
+
+    value, error = app_module._coerce_int_range("0", field="page", minimum=1, maximum=24, default=12)
+    assert value == 12
+    assert error == "page must be at least 1."
+
+    value, error = app_module._coerce_int_range("abc", field="page", minimum=1, maximum=24, default=12)
+    assert value == 12
+    assert error == "page must be an integer."
+
+
+def test_coerce_bool_values_and_defaults():
+    app_module = _load_imager_app_module_for_tests()
+
+    value, error = app_module._coerce_bool("yes", field="use_cache", default=True)
+    assert value is True
+    assert error is None
+
+    value, error = app_module._coerce_bool(0, field="use_cache", default=True)
+    assert value is False
+    assert error is None
+
+    value, error = app_module._coerce_bool("n", field="use_cache", default=True)
+    assert value is False
+    assert error is None
+
+    value, error = app_module._coerce_bool("maybe", field="use_cache", default=True)
+    assert value is True
+    assert error == "use_cache must be a boolean."
+
+
+def test_discover_instagram_reels_with_ytdlp_short_circuit_for_invalid_range():
+    app_module = _load_imager_app_module_for_tests()
+
+    urls, discovery_error = app_module._discover_instagram_reels_with_ytdlp(
+        "demo", start=10, end=2, use_cache=False, order="newest"
+    )
+    assert urls == []
+    assert discovery_error is None
+
+
+def test_api_imager_reels_discover_requires_json_object():
+    app_module = _load_imager_app_module_for_tests()
+
+    response, status_code = _extract_json_response(_run_imager_reels_discover_with_body(app_module, body="not-an-object"))
+    assert status_code == 400
+    assert response.get("error_code") == "IMAGER_INVALID_BODY"
+
+
+def test_api_imager_reels_discover_uses_cache_when_available():
+    app_module = _load_imager_app_module_for_tests()
+
+    original_load_cache = app_module._load_imager_reels_cache
+    original_discover = app_module._discover_instagram_reels_with_ytdlp
+
+    discovered_calls = {"count": 0}
+
+    def fake_load_imager_reels_cache(_cache_path):
+        return [
+            "https://www.instagram.com/p/abc1/",
+            "https://www.instagram.com/p/abc2/",
+        ]
+
+    def fake_discover(*_args, **_kwargs):
+        discovered_calls["count"] += 1
+        return None, {
+            "ok": False,
+            "error": "should not be called",
+            "error_code": "IMAGER_REELS_DISCOVERY_FAILED",
+            "status_code": 502,
+        }
+
+    app_module._load_imager_reels_cache = fake_load_imager_reels_cache
+    app_module._discover_instagram_reels_with_ytdlp = fake_discover
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_imager_reels_discover_with_body(
+                app_module,
+                {
+                    "username": "example_user",
+                    "page": 1,
+                    "page_size": 12,
+                    "max_results": 50,
+                    "use_cache": True,
+                    "order": "newest",
+                },
+            )
+        )
+        assert status_code == 200
+        assert isinstance(response, list)
+        assert response == [
+            "https://www.instagram.com/p/abc1/",
+            "https://www.instagram.com/p/abc2/",
+        ]
+        assert discovered_calls["count"] == 0
+    finally:
+        app_module._load_imager_reels_cache = original_load_cache
+        app_module._discover_instagram_reels_with_ytdlp = original_discover
+
+
+def test_api_imager_reels_discover_discovers_and_saves_on_cache_miss():
+    app_module = _load_imager_app_module_for_tests()
+
+    original_load_cache = app_module._load_imager_reels_cache
+    original_discover = app_module._discover_instagram_reels_with_ytdlp
+    original_save_cache = app_module._save_imager_reels_cache
+
+    calls = {"load": False, "discover": 0, "saved": None}
+
+    def fake_load_imager_reels_cache(_cache_path):
+        calls["load"] = True
+        return None
+
+    def fake_discover_instagram_reels_with_ytdlp(
+        username, start, end, use_cache=False, order="newest"
+    ):  # noqa: ARG001
+        calls["discover"] += 1
+        return [
+            "https://www.instagram.com/p/discovered-1/",
+            "https://www.instagram.com/p/discovered-2/",
+        ], None
+
+    def fake_save_imager_reels_cache(cache_path, urls, *, username, page, page_size, max_results, order):  # noqa: ARG001
+        calls["saved"] = {
+            "cache_path": cache_path,
+            "urls": urls,
+            "username": username,
+            "page": page,
+            "page_size": page_size,
+            "max_results": max_results,
+            "order": order,
+        }
+
+    app_module._load_imager_reels_cache = fake_load_imager_reels_cache
+    app_module._discover_instagram_reels_with_ytdlp = fake_discover_instagram_reels_with_ytdlp
+    app_module._save_imager_reels_cache = fake_save_imager_reels_cache
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_imager_reels_discover_with_body(
+                app_module,
+                {
+                    "username": "example_user",
+                    "page": 2,
+                    "page_size": 5,
+                    "max_results": 50,
+                    "use_cache": True,
+                    "order": "oldest",
+                },
+            )
+        )
+        assert status_code == 200
+        assert response == [
+            "https://www.instagram.com/p/discovered-1/",
+            "https://www.instagram.com/p/discovered-2/",
+        ]
+        assert calls["load"] is True
+        assert calls["discover"] == 1
+        assert calls["saved"]["username"] == "example_user"
+        assert calls["saved"]["page"] == 2
+        assert calls["saved"]["page_size"] == 5
+        assert calls["saved"]["max_results"] == 50
+        assert calls["saved"]["order"] == "oldest"
+        assert calls["saved"]["urls"] == response
+    finally:
+        app_module._load_imager_reels_cache = original_load_cache
+        app_module._discover_instagram_reels_with_ytdlp = original_discover
+        app_module._save_imager_reels_cache = original_save_cache
+
+
+def test_api_imager_reels_discover_reports_upstream_errors():
+    app_module = _load_imager_app_module_for_tests()
+
+    original_load_cache = app_module._load_imager_reels_cache
+    original_discover = app_module._discover_instagram_reels_with_ytdlp
+
+    def fake_load_imager_reels_cache(_cache_path):
+        return None
+
+    def fake_discover_instagram_reels_with_ytdlp(
+        _username, start, end, use_cache=False, order="newest"  # noqa: ARG001
+    ):
+        return None, {
+            "ok": False,
+            "error": "rate limited",
+            "error_code": "IMAGER_REELS_RATE_LIMITED",
+            "status_code": 429,
+        }
+
+    app_module._load_imager_reels_cache = fake_load_imager_reels_cache
+    app_module._discover_instagram_reels_with_ytdlp = fake_discover_instagram_reels_with_ytdlp
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_imager_reels_discover_with_body(
+                app_module,
+                {
+                    "username": "example_user",
+                    "page": 1,
+                    "page_size": 10,
+                    "max_results": 50,
+                    "use_cache": True,
+                    "order": "newest",
+                },
+            )
+        )
+        assert status_code == 429
+        assert response.get("error_code") == "IMAGER_REELS_RATE_LIMITED"
+    finally:
+        app_module._load_imager_reels_cache = original_load_cache
+        app_module._discover_instagram_reels_with_ytdlp = original_discover
+
+
+def test_api_imager_reels_discover_empty_page_returns_cached_empty_and_saves():
+    app_module = _load_imager_app_module_for_tests()
+
+    original_load_cache = app_module._load_imager_reels_cache
+    original_discover = app_module._discover_instagram_reels_with_ytdlp
+    original_save_cache = app_module._save_imager_reels_cache
+
+    calls = {"load": False, "discover": 0, "saved": 0}
+
+    def fake_load_imager_reels_cache(_cache_path):
+        calls["load"] = True
+        return None
+
+    def fake_discover_instagram_reels_with_ytdlp(*_args, **_kwargs):
+        calls["discover"] += 1
+        return ["https://www.instagram.com/p/should-not-see"], None
+
+    def fake_save_imager_reels_cache(_cache_path, _urls, **_kwargs):
+        calls["saved"] += 1
+
+    app_module._load_imager_reels_cache = fake_load_imager_reels_cache
+    app_module._discover_instagram_reels_with_ytdlp = fake_discover_instagram_reels_with_ytdlp
+    app_module._save_imager_reels_cache = fake_save_imager_reels_cache
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_imager_reels_discover_with_body(
+                app_module,
+                {
+                    "username": "example_user",
+                    "page": 2,
+                    "page_size": 5,
+                    "max_results": 1,
+                    "use_cache": True,
+                    "order": "newest",
+                },
+            )
+        )
+        assert status_code == 200
+        assert response == []
+        assert calls["load"] is True
+        assert calls["discover"] == 0
+        assert calls["saved"] == 1
+    finally:
+        app_module._load_imager_reels_cache = original_load_cache
+        app_module._discover_instagram_reels_with_ytdlp = original_discover
+        app_module._save_imager_reels_cache = original_save_cache
