@@ -34,17 +34,25 @@
 
       <div class="status-grid">
         <div><strong>Source image</strong></div>
-        <div><input id="sourcePath" type="text" value="{{ source_default }}" /></div>
+        <div>
+          <input id="sourcePath" type="text" value="{{ source_default }}" />
+          <div class="factset-actions" style="margin-top:8px;">
+            <input id="sourceLocalFile" type="file" accept="image/*,.png,.jpg,.jpeg,.webp,.bmp,.gif,.tiff" style="display:none;" />
+            <button id="browseSourceBtn" class="secondary" type="button">Browse local image</button>
+          </div>
+          <p class="help">Source image acquisition limit: 10MB.</p>
+          <pre id="sourceAcquireOutput">No source upload action yet.</pre>
+        </div>
         <div><strong>Target video</strong></div>
         <div>
           <input id="targetPath" type="text" value="{{ target_default }}" />
           <div class="factset-actions" style="margin-top:8px;">
             <input id="targetLocalFile" type="file" accept="video/*,.mp4,.mov,.m4v,.mkv,.webm,.avi" style="display:none;" />
             <button id="browseTargetBtn" class="secondary" type="button">Browse local video</button>
-            <input id="targetUrl" type="text" placeholder="https://... direct video URL (e.g. instagram CDN mp4 link)" />
+            <input id="targetUrl" type="text" placeholder='https://... or JSON array e.g. ["https://...", "https://..."]' />
             <button id="downloadTargetBtn" class="secondary" type="button">Download URL</button>
           </div>
-          <p class="help">Target acquisition limit: 50MB. URL must resolve to a direct video file.</p>
+           <p class="help">Target acquisition limit: 50MB. URL must resolve to a direct video file. You can run batches by pasting a JSON array in the target URL field.</p>
           <pre id="targetAcquireOutput">No target upload/download action yet.</pre>
         </div>
         <div><strong>Instagram auth</strong></div>
@@ -83,10 +91,10 @@
         </div>
         <div><strong>Mask padding</strong></div>
         <div class="factset-actions">
-          <input id="padTop" type="number" min="0" max="120" value="40" />
-          <input id="padRight" type="number" min="0" max="120" value="40" />
-          <input id="padBottom" type="number" min="0" max="120" value="40" />
-          <input id="padLeft" type="number" min="0" max="120" value="40" />
+          <input id="padTop" type="number" min="0" max="120" value="10" />
+          <input id="padRight" type="number" min="0" max="120" value="10" />
+          <input id="padBottom" type="number" min="0" max="120" value="10" />
+          <input id="padLeft" type="number" min="0" max="120" value="10" />
         </div>
         <div><strong>Output quality</strong></div>
         <div><input id="videoQuality" type="number" min="1" max="100" value="90" /></div>
@@ -100,10 +108,17 @@
 
     <section>
       <h2>Runtime Log</h2>
-      <div class="factset-actions">
-        <button id="logsBtn" class="secondary">Load Logs</button>
+      <p class="help">Runtime logs are now tailed while a run is active (latest 10 lines).</p>
+      <pre id="runLogs">Waiting for run output...</pre>
+    </section>
+
+    <section>
+      <h2>Failure Recovery Note</h2>
+      <div class="help">
+        If a run exits immediately after a brief progress line, check for a "step check failed" pattern in the logs. In that case, verify the guard points in
+        <code>facefusion/core.py</code> and <code>facefusion/content_analyser.py</code> were updated together.
+        If this happens again, keep the same pattern: make the failing pre-check return a conservative <code>True</code> path so the headless flow can continue while you investigate.
       </div>
-      <pre id="runLogs">No logs loaded.</pre>
     </section>
 
     <section>
@@ -123,6 +138,9 @@
 const variantEl = document.getElementById('variant');
 const sourcePathEl = document.getElementById('sourcePath');
 const targetPathEl = document.getElementById('targetPath');
+const sourceLocalFileEl = document.getElementById('sourceLocalFile');
+const browseSourceBtn = document.getElementById('browseSourceBtn');
+const sourceAcquireOutputEl = document.getElementById('sourceAcquireOutput');
 const targetLocalFileEl = document.getElementById('targetLocalFile');
 const browseTargetBtn = document.getElementById('browseTargetBtn');
 const targetUrlEl = document.getElementById('targetUrl');
@@ -144,15 +162,160 @@ const videoQualityEl = document.getElementById('videoQuality');
 const runBtn = document.getElementById('runBtn');
 const stopBtn = document.getElementById('stopBtn');
 const refreshBtn = document.getElementById('refreshBtn');
-const logsBtn = document.getElementById('logsBtn');
 const runStatusEl = document.getElementById('runStatus');
 const runLogsEl = document.getElementById('runLogs');
 const debugOutputEl = document.getElementById('debugOutput');
 
 let latestStatus = null;
+let logsPollTimer = null;
+let logsPollRunId = null;
+let lastShownLogRunId = null;
+let imagerLimits = {
+  targetMaxBytes: 50 * 1024 * 1024,
+  sourceMaxBytes: 10 * 1024 * 1024,
+};
+
+function setRunButtonState({ running = false, label = 'Run FaceFusion' }) {
+  runBtn.textContent = label;
+  runBtn.disabled = Boolean(running);
+}
 
 function fmt(v) {
   return JSON.stringify(v, null, 2);
+}
+
+function formatBytes(value) {
+  const valueNumber = Number(value);
+  if (!Number.isFinite(valueNumber) || valueNumber < 0) {
+    return 'n/a';
+  }
+  if (valueNumber < 1024) {
+    return `${valueNumber} bytes`;
+  }
+  if (valueNumber < 1024 * 1024) {
+    return `${Math.round(valueNumber / 1024)} KB`;
+  }
+  return `${Math.round(valueNumber / (1024 * 1024))} MB`;
+}
+
+function tailOutputText(text, lines = 10) {
+  const safeText = String(text || '');
+  const parts = safeText.replace(/\r/g, '').split('\n');
+  return parts.slice(Math.max(parts.length - lines, 0)).join('\n');
+}
+
+async function readResponseJson(response) {
+  const rawText = await response.text();
+  if (!rawText) {
+    return { ok: false, error: `Empty response body (${response.status} ${response.statusText})`, error_code: 'IMAGER_EMPTY_RESPONSE' };
+  }
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return {
+      ok: false,
+      error: `Non-JSON response from server: ${rawText.slice(0, 300)}`,
+      error_code: 'IMAGER_INVALID_RESPONSE',
+      status: response.status,
+      status_text: response.statusText,
+    };
+  }
+}
+
+function normalizeTargetUrlText(raw) {
+  let text = String(raw || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  if ((text[0] === '"' && text[text.length - 1] === '"') || (text[0] === "'" && text[text.length - 1] === "'")) {
+    text = text.substring(1, text.length - 1).trim();
+  }
+  text = text.replace(/\u200b/g, '').trim();
+
+  // Repair common clipboard/transport issues like https:/example.com -> https://example.com
+  if (/^(https?):\/[^/]/i.test(text)) {
+    text = text.replace(/^(https?):\/([^/])/i, '$1://$2');
+  }
+
+  if (text.startsWith('//')) {
+    return `https:${text}`;
+  }
+
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    return text;
+  }
+
+  if (text.startsWith('www.')) {
+    return `https://${text}`;
+  }
+
+  if (text.includes('instagram.com/') || text.includes('instagr.am/')) {
+    return `https://${text.replace(/^\/+/, '')}`;
+  }
+
+  return text;
+}
+
+function extractEmbeddedJsonArrayText(raw) {
+  const text = String(raw || '');
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) {
+    return null;
+  }
+  const candidate = text.slice(start, end + 1).trim();
+  if (!candidate.startsWith('[') || !candidate.endsWith(']')) {
+    return null;
+  }
+  return candidate;
+}
+
+function parseJsonArrayText(raw) {
+  const base = String(raw || '').trim();
+  if (!base) {
+    return { ok: false, error: 'Target URL JSON array text is empty.' };
+  }
+
+  const candidates = [];
+  const stripped = base.replace(/^\s+|\s+$/g, '');
+  const unescaped = stripped.replace(/\\"/g, '"');
+  const trailingRemoved = unescaped.replace(/,\s*\]/g, ']');
+  const singleQuoted = stripped.replace(/'/g, '"');
+  const singleUnescaped = unescaped.replace(/'/g, '"');
+  const singleTrailing = singleUnescaped.replace(/,\s*\]/g, ']');
+
+  candidates.push(stripped);
+  if (!candidates.includes(unescaped)) {
+    candidates.push(unescaped);
+  }
+  if (!candidates.includes(trailingRemoved)) {
+    candidates.push(trailingRemoved);
+  }
+  if (!candidates.includes(singleQuoted)) {
+    candidates.push(singleQuoted);
+  }
+  if (!candidates.includes(singleUnescaped)) {
+    candidates.push(singleUnescaped);
+  }
+  if (!candidates.includes(singleTrailing)) {
+    candidates.push(singleTrailing);
+  }
+
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (!Array.isArray(parsed)) {
+        return { ok: false, error: 'Target URL JSON array is not a JSON array.' };
+      }
+      return { ok: true, parsed };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  return { ok: false, error: `Invalid target URL JSON array: ${lastError || 'unsupported format.'}` };
 }
 
 function toInt(inputEl, fallback) {
@@ -167,21 +330,75 @@ function selectedProcessors() {
   return out;
 }
 
+function parseTargetValueForRun() {
+  const raw = (targetUrlEl.value || '').trim();
+  if (!raw) {
+    const fallback = (targetPathEl.value || '').trim();
+    if (!fallback) {
+      return { ok: false, error: 'Provide a target path or a URL/JSON array in Target URL first.' };
+    }
+    return { ok: true, target_path: fallback };
+  }
+
+  if (raw.startsWith('[') && raw.endsWith(']')) {
+    const parsedResult = parseJsonArrayText(raw);
+    if (!parsedResult.ok) {
+      return { ok: false, error: parsedResult.error || 'Invalid target URL JSON array.' };
+    }
+    if (!parsedResult.parsed.length) {
+      return { ok: false, error: 'Target URL JSON array cannot be empty.' };
+    }
+    const normalized = parsedResult.parsed
+      .map((value) => (typeof value === 'string' ? normalizeTargetUrlText(value) : ''))
+      .filter((value) => value.length > 0);
+    if (normalized.length === 0) {
+      return { ok: false, error: 'Target URL JSON array entries cannot be empty.' };
+    }
+    return { ok: true, target_path: normalized };
+  }
+
+  const extracted = extractEmbeddedJsonArrayText(raw);
+  if (extracted && extracted !== raw) {
+    const parsedResult = parseJsonArrayText(extracted);
+    if (!parsedResult.ok) {
+      return { ok: false, error: parsedResult.error || 'Invalid target URL JSON array.' };
+    }
+    if (!parsedResult.parsed.length) {
+      return { ok: false, error: 'Target URL JSON array cannot be empty.' };
+    }
+    const normalized = parsedResult.parsed
+      .map((value) => (typeof value === 'string' ? normalizeTargetUrlText(value) : ''))
+      .filter((value) => value.length > 0);
+    if (normalized.length === 0) {
+      return { ok: false, error: 'Target URL JSON array entries cannot be empty.' };
+    }
+    return { ok: true, target_path: normalized };
+  }
+
+  return { ok: true, target_path: normalizeTargetUrlText(raw) };
+}
+
 function buildRunPayload() {
+  const targetSpec = parseTargetValueForRun();
+  if (!targetSpec.ok) {
+    return { ok: false, error: targetSpec.error };
+  }
+
   return {
+    ok: true,
     variant: variantEl.value,
     source_path: sourcePathEl.value.trim(),
-    target_path: targetPathEl.value.trim(),
+    target_path: targetSpec.target_path,
     output_path: outputPathEl.value.trim(),
     execution_provider: executionProviderEl.value,
     face_selector_mode: 'one',
     face_selector_order: 'best-worst',
     face_mask_types: ['box', 'occlusion'],
     face_mask_padding: [
-      toInt(padTopEl, 40),
-      toInt(padRightEl, 40),
-      toInt(padBottomEl, 40),
-      toInt(padLeftEl, 40),
+      toInt(padTopEl, 10),
+      toInt(padRightEl, 10),
+      toInt(padBottomEl, 10),
+      toInt(padLeftEl, 10),
     ],
     processors: selectedProcessors(),
     face_swapper_model: 'inswapper_128_fp16',
@@ -190,8 +407,145 @@ function buildRunPayload() {
   };
 }
 
+function startLogPoll(runId) {
+  const normalizedRunId = String(runId || '').trim();
+  if (!normalizedRunId) {
+    stopLogPoll();
+    return;
+  }
+
+  if (logsPollTimer && logsPollRunId === normalizedRunId) {
+    return;
+  }
+
+  stopLogPoll();
+  logsPollRunId = normalizedRunId;
+  loadLogTail({ runId: logsPollRunId });
+  logsPollTimer = setInterval(() => {
+    void loadLogTail({ runId: logsPollRunId });
+  }, 1500);
+}
+
+function stopLogPoll() {
+  if (logsPollTimer) {
+    clearInterval(logsPollTimer);
+    logsPollTimer = null;
+  }
+  logsPollRunId = null;
+}
+
+async function loadLogTail({ runId } = {}) {
+  const activeRunId = String(runId || '').trim() || '';
+  if (!activeRunId && latestStatus) {
+    if (latestStatus.current && latestStatus.current.run_id) {
+      runId = latestStatus.current.run_id;
+    } else if (latestStatus.last && latestStatus.last.run_id) {
+      runId = latestStatus.last.run_id;
+    }
+  }
+  const requestedRunId = String(runId || '').trim();
+  const url = requestedRunId ? `/api/imager/logs?run_id=${encodeURIComponent(requestedRunId)}` : '/api/imager/logs';
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    const data = await readResponseJson(res);
+    if (!data.ok) {
+      runLogsEl.textContent = `Waiting for logs... ${data.error || 'not available yet.'}`;
+      return;
+    }
+
+    const runTitle = data.run_id || requestedRunId || 'n/a';
+    const batchTitle = data.batch_id ? ` / ${data.batch_id}` : '';
+    const byTag = data.selected_by ? ` (${data.selected_by})` : '';
+    const title = `Run ${runTitle}${batchTitle} ${data.status || 'unknown'}${byTag}`;
+    if (data.run_id) {
+      lastShownLogRunId = String(data.run_id);
+    } else if (requestedRunId) {
+      lastShownLogRunId = requestedRunId;
+    }
+    const output = tailOutputText(data.output, 10);
+    const display = output ? output : 'No log output yet.';
+    runLogsEl.textContent = `${title}\n${'-'.repeat(Math.min(title.length, 120))}\n${display}`;
+  } catch (err) {
+    runLogsEl.textContent = `Failed to load logs: ${err}`;
+  }
+}
+
+async function uploadLocalSource(file) {
+  if (!file) {
+    sourceAcquireOutputEl.textContent = 'No file selected.';
+    return;
+  }
+
+  if (file.size > imagerLimits.sourceMaxBytes) {
+    sourceAcquireOutputEl.textContent = `File exceeds ${formatBytes(imagerLimits.sourceMaxBytes)} limit.`;
+    return;
+  }
+
+  sourceAcquireOutputEl.textContent = `Uploading ${file.name}...`;
+  const form = new FormData();
+  form.append('source_image', file);
+  try {
+    const res = await fetch('/api/imager/source/upload', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await readResponseJson(res);
+    if (data.ok && data.source_path) {
+      sourcePathEl.value = data.source_path;
+    }
+    sourceAcquireOutputEl.textContent = fmt(data);
+  } catch (err) {
+    sourceAcquireOutputEl.textContent = `Source upload failed: ${err}`;
+  }
+}
+
 function renderStatus(data) {
   latestStatus = data;
+  const targetMaxBytes = Number(data && data.target_max_bytes);
+  const sourceMaxBytes = Number(data && data.source_max_bytes);
+  if (Number.isFinite(targetMaxBytes)) {
+    imagerLimits.targetMaxBytes = targetMaxBytes;
+  }
+  if (Number.isFinite(sourceMaxBytes)) {
+    imagerLimits.sourceMaxBytes = sourceMaxBytes;
+  }
+
+  const current = (data && data.current) || null;
+  const currentBatch = current && (current.batch_id || '').trim();
+  const currentItemIndex = Number(current && current.current_item_index);
+  const currentItemTotal = Number(current && current.items_total);
+  const currentFailures = Number(current && current.batch_failures);
+  const currentItemStatus = (current && current.item_status) ? String(current.item_status) : '';
+  const progressLine = currentBatch
+    ? `Current batch: ${currentBatch}`
+    : 'Current batch: n/a';
+  const itemLine = Number.isFinite(currentItemIndex) && Number.isFinite(currentItemTotal) && currentItemTotal > 0
+    ? `Current item: ${currentItemStatus ? `${currentItemStatus} ` : ''}${currentItemIndex}/${currentItemTotal}`
+    : null;
+  const failureLine = Number.isFinite(currentFailures)
+    ? `Current batch failures: ${currentFailures}`
+    : null;
+  const currentState = String((current && current.status) || '').toLowerCase();
+  const batchRunning = Boolean(current && [
+    'running',
+    'queued',
+    'stopping',
+    'downloading',
+  ].includes(currentState));
+  if (batchRunning && currentItemStatus) {
+    const itemText = Number.isFinite(currentItemIndex) ? currentItemIndex : 1;
+    const label = currentItemStatus
+      ? `${currentItemStatus.charAt(0).toUpperCase()}${currentItemStatus.slice(1)} ${itemText}`
+      : 'Running';
+    setRunButtonState({
+      running: true,
+      label,
+    });
+  } else if (batchRunning) {
+    setRunButtonState({ running: true, label: 'Running' });
+  } else {
+    setRunButtonState({ running: false, label: 'Run FaceFusion' });
+  }
   const lines = [
     `Checked: ${data.checked_at || 'n/a'}`,
     `FaceFusion root: ${data.facefusion_root}`,
@@ -199,12 +553,17 @@ function renderStatus(data) {
     `Script exists: ${data.script_exists}`,
     `Default source exists: ${data.source_exists}`,
     `Default target exists: ${data.target_exists}`,
+    `Source upload limit: ${formatBytes(imagerLimits.sourceMaxBytes)}`,
+    `Target upload limit: ${formatBytes(imagerLimits.targetMaxBytes)}`,
     `Instagram cookies present: ${data.cookies_exists}`,
     `Instagram cookies size: ${data.cookies_size_bytes ?? 'n/a'} bytes`,
+    progressLine,
     '',
+    itemLine ? itemLine : 'Current item: n/a',
+    failureLine ? failureLine : 'Current batch failures: n/a',
     'Current run',
     '-----------',
-    fmt(data.current),
+    fmt(current),
     '',
     'Last run',
     '--------',
@@ -226,7 +585,7 @@ async function uploadCookies(file) {
       method: 'POST',
       body: form,
     });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     cookiesOutputEl.textContent = fmt(data);
     await refreshStatus();
   } catch (err) {
@@ -238,7 +597,7 @@ async function clearCookies() {
   cookiesOutputEl.textContent = 'Clearing cookies...';
   try {
     const res = await fetch('/api/imager/cookies/clear', { method: 'POST' });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     cookiesOutputEl.textContent = fmt(data);
     await refreshStatus();
   } catch (err) {
@@ -249,26 +608,58 @@ async function clearCookies() {
 async function refreshStatus() {
   try {
     const res = await fetch('/api/imager/status', { cache: 'no-store' });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     renderStatus(data);
+
+    const current = (data && data.current) || null;
+    const isRunning = Boolean(current && String(current.status).trim() && current.run_id && ['running', 'queued', 'stopping'].includes(String(current.status)));
+    if (isRunning) {
+      startLogPoll(current.run_id);
+    } else if (logsPollRunId) {
+      const endedRunId = logsPollRunId;
+      stopLogPoll();
+      await loadLogTail({ runId: endedRunId });
+    } else {
+      const lastRunId = (data && data.last && data.last.run_id) ? String(data.last.run_id) : '';
+      if (lastRunId && lastRunId !== lastShownLogRunId) {
+        await loadLogTail({ runId: lastRunId });
+      }
+    }
   } catch (err) {
     runStatusEl.textContent = `Failed to load status: ${err}`;
   }
 }
 
 async function runFaceFusion() {
+  setRunButtonState({ running: true, label: 'Starting...' });
   runStatusEl.textContent = 'Starting FaceFusion run...';
   try {
+    const payload = buildRunPayload();
+    if (!payload.ok) {
+      runStatusEl.textContent = `Run request failed: ${payload.error}`;
+      setRunButtonState({ running: false, label: 'Run FaceFusion' });
+      return;
+    }
+
     const res = await fetch('/api/imager/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildRunPayload()),
+      body: JSON.stringify(payload),
     });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     runStatusEl.textContent = fmt(data);
+    if (data.ok && data.run_id) {
+      const queuedLabel = data.batch_total ? `Queued ${data.batch_total}` : 'Queued';
+      setRunButtonState({ running: true, label: queuedLabel });
+      startLogPoll(data.run_id);
+      await loadLogTail({ runId: data.run_id });
+    } else {
+      setRunButtonState({ running: false, label: 'Run FaceFusion' });
+    }
     await refreshStatus();
   } catch (err) {
     runStatusEl.textContent = `Run request failed: ${err}`;
+    setRunButtonState({ running: false, label: 'Run FaceFusion' });
   }
 }
 
@@ -277,8 +668,8 @@ async function uploadLocalTarget(file) {
     targetAcquireOutputEl.textContent = 'No file selected.';
     return;
   }
-  if (file.size > 50 * 1024 * 1024) {
-    targetAcquireOutputEl.textContent = 'File exceeds 50MB limit.';
+  if (file.size > imagerLimits.targetMaxBytes) {
+    targetAcquireOutputEl.textContent = `File exceeds ${formatBytes(imagerLimits.targetMaxBytes)} limit.`;
     return;
   }
 
@@ -290,7 +681,7 @@ async function uploadLocalTarget(file) {
       method: 'POST',
       body: form,
     });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     if (data.ok && data.target_path) {
       targetPathEl.value = data.target_path;
     }
@@ -301,9 +692,16 @@ async function uploadLocalTarget(file) {
 }
 
 async function downloadTargetFromUrl() {
-  const url = (targetUrlEl.value || '').trim();
+  const url = normalizeTargetUrlText(targetUrlEl.value || '');
   if (!url) {
     targetAcquireOutputEl.textContent = 'Enter a URL first.';
+    return;
+  }
+  const normalizedForMode = String(targetUrlEl.value || '').trim();
+  const looksLikeArray = (normalizedForMode.startsWith('[') && normalizedForMode.endsWith(']'))
+    || extractEmbeddedJsonArrayText(normalizedForMode) !== null;
+  if (looksLikeArray) {
+    targetAcquireOutputEl.textContent = 'Download URL supports a single URL only. For batches, keep the JSON array in Target URL and click Run.';
     return;
   }
   targetAcquireOutputEl.textContent = 'Downloading remote target video...';
@@ -313,7 +711,7 @@ async function downloadTargetFromUrl() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     if (data.ok && data.target_path) {
       targetPathEl.value = data.target_path;
     }
@@ -327,24 +725,16 @@ async function stopFaceFusion() {
   runStatusEl.textContent = 'Stopping active run...';
   try {
     const res = await fetch('/api/imager/stop', { method: 'POST' });
-    const data = await res.json();
+    const data = await readResponseJson(res);
+    const runId = (data && data.run_id) ? data.run_id : null;
     runStatusEl.textContent = fmt(data);
     await refreshStatus();
+    stopLogPoll();
+    if (runId) {
+      await loadLogTail({ runId });
+    }
   } catch (err) {
     runStatusEl.textContent = `Stop request failed: ${err}`;
-  }
-}
-
-async function loadLogs() {
-  runLogsEl.textContent = 'Loading logs...';
-  try {
-    const runId = (latestStatus && latestStatus.current && latestStatus.current.run_id) || (latestStatus && latestStatus.last && latestStatus.last.run_id) || '';
-    const url = runId ? `/api/imager/logs?run_id=${encodeURIComponent(runId)}` : '/api/imager/logs';
-    const res = await fetch(url, { cache: 'no-store' });
-    const data = await res.json();
-    runLogsEl.textContent = data.ok ? String(data.output || '') : fmt(data);
-  } catch (err) {
-    runLogsEl.textContent = `Failed to load logs: ${err}`;
   }
 }
 
@@ -360,7 +750,7 @@ async function runDebug(action) {
         target_path: targetPathEl.value.trim(),
       }),
     });
-    const data = await res.json();
+    const data = await readResponseJson(res);
     debugOutputEl.textContent = fmt(data);
   } catch (err) {
     debugOutputEl.textContent = `Debug request failed: ${err}`;
@@ -370,7 +760,12 @@ async function runDebug(action) {
 runBtn.addEventListener('click', runFaceFusion);
 stopBtn.addEventListener('click', stopFaceFusion);
 refreshBtn.addEventListener('click', refreshStatus);
-logsBtn.addEventListener('click', loadLogs);
+browseSourceBtn.addEventListener('click', () => sourceLocalFileEl.click());
+sourceLocalFileEl.addEventListener('change', async () => {
+  const file = sourceLocalFileEl.files && sourceLocalFileEl.files[0];
+  await uploadLocalSource(file || null);
+  sourceLocalFileEl.value = '';
+});
 browseTargetBtn.addEventListener('click', () => targetLocalFileEl.click());
 targetLocalFileEl.addEventListener('change', async () => {
   const file = targetLocalFileEl.files && targetLocalFileEl.files[0];

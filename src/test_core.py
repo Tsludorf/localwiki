@@ -8,6 +8,8 @@ import sys
 import tempfile
 import shutil
 from pathlib import Path
+import importlib.util
+import types
 
 # Add project root and src to Python path for direct execution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +33,11 @@ from core import (
     resolve_model_ingestion_config,
 )
 from parsers import ParserFactory
-import pytest
+# Optional in non-test-runtime environments where pytest is unavailable.
+try:  # pragma: no cover - best effort import shim
+    import pytest  # type: ignore
+except Exception:  # pragma: no cover
+    pytest = None  # type: ignore
 
 
 def test_detect_source_type_and_mime():
@@ -237,7 +243,7 @@ def test_chunker():
     from core import Chunker
     
     # Test chunker with simple text
-    chunker = Chunker(max_tokens=100)
+    chunker = Chunker(max_tokens=100, overlap_tokens=50)
     
     # Simple test text that's longer than max tokens to create multiple chunks
     test_text = "This is a sample text.\n\nThis is another paragraph.\n\n" * 50  # Create text that will definitely exceed chunk size
@@ -364,3 +370,110 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Test failed: {e}")
         sys.exit(1)
+
+
+def _load_imager_app_module_for_tests():
+    try:
+        import flask  # type: ignore
+    except Exception:
+        fake_flask = types.ModuleType("flask")
+
+        class _FakeFlask:
+            def __init__(self, *args, **kwargs):
+                self.config = {}
+
+            def route(self, *args, **kwargs):  # noqa: ARG002
+                def decorator(func):
+                    return func
+
+                return decorator
+
+        def _fake_jsonify(*args, **kwargs):
+            if args and len(args) == 1 and not kwargs:
+                return args[0]
+            if args and len(args) > 1 and not kwargs:
+                return {"payload": list(args)}
+            return kwargs
+
+        def _fake_render_template(*args, **kwargs):  # noqa: ARG001
+            return ""
+
+        fake_flask.Flask = _FakeFlask
+        fake_flask.jsonify = _fake_jsonify
+        fake_flask.render_template = _fake_render_template
+        fake_flask.request = types.SimpleNamespace()
+        sys.modules["flask"] = fake_flask
+
+    spec = importlib.util.spec_from_file_location("warlock_ui_app", PROJECT_ROOT / "ui" / "app.py")
+    assert spec is not None
+    assert spec.loader is not None
+    if "warlock_ui_app" in sys.modules:
+        module = sys.modules["warlock_ui_app"]
+    else:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["warlock_ui_app"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def test_normalize_imager_target_value_parses_embedded_array_with_repaired_urls():
+    app_module = _load_imager_app_module_for_tests()
+    raw = 'https://[   \\\"https:/www.instagram.com/p/DYegkieOUZ4/\\\",   \\\"https:/www.instagram.com/p/DY3Xxvqs4Bk/\\\",   \\\"https:/www.instagram.com/p/DZI5bD-N36f/\\\",   \\\"https:/www.instagram.com/p/DZJORlNst3W/\\\" ]'
+    normalized, error = app_module._normalize_imager_target_value(raw)
+
+    assert error is None
+    assert normalized is not None
+    assert normalized == [
+        "https://www.instagram.com/p/DYegkieOUZ4/",
+        "https://www.instagram.com/p/DY3Xxvqs4Bk/",
+        "https://www.instagram.com/p/DZI5bD-N36f/",
+        "https://www.instagram.com/p/DZJORlNst3W/",
+    ]
+
+
+def test_normalize_imager_target_value_parses_single_quoted_array_and_trailing_commas():
+    app_module = _load_imager_app_module_for_tests()
+    raw = "['https:/www.instagram.com/p/one/', 'https:/www.instagram.com/p/two/',]"
+    normalized, error = app_module._normalize_imager_target_value(raw)
+
+    assert error is None
+    assert normalized is not None
+    assert normalized == ["https://www.instagram.com/p/one/", "https://www.instagram.com/p/two/"]
+
+
+def test_resolve_imager_targets_report_target_index_for_missing_target():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as temp_target:
+        temp_target.write(b"ready")
+        target_path = temp_target.name
+
+    try:
+        resolved, resolve_error, status_code = app_module._resolve_imager_targets([target_path, "missing-target", target_path])
+        assert resolved is None
+        assert resolve_error is not None
+        assert resolve_error.get("error_code") == "IMAGER_TARGET_MISSING"
+        assert resolve_error.get("target_index") == 2
+        assert status_code == 400
+    finally:
+        if os.path.exists(target_path):
+            os.unlink(target_path)
+
+
+def test_resolve_imager_targets_parses_embedded_array_before_resolving():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as temp_target:
+        temp_target.write(b"ready")
+        target_path = temp_target.name
+
+    try:
+        raw = f'[ "{target_path}", "{target_path}" ]'
+        resolved, resolve_error, status_code = app_module._resolve_imager_targets([raw])
+
+        assert resolve_error is None
+        assert status_code is None
+        assert resolved == [target_path, target_path]
+    finally:
+        if os.path.exists(target_path):
+            os.unlink(target_path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import base64
 import html
 import importlib
@@ -18,7 +19,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 
@@ -102,7 +103,31 @@ FACTSET_ALLOWED_BASE_DIRS = [
     Path("/secure/factset"),
     LOCALWIKI_ROOT / "data" / "secrets" / "factset",
 ]
-IMAGER_ROOT = Path("/home/loc-llm/facefusion")
+def _resolve_imager_root() -> Path:
+    configured_root = os.environ.get("WARLOCK_IMAGER_ROOT") or os.environ.get("FACEFUSION_ROOT")
+    candidates: list[Path] = []
+
+    if configured_root:
+        candidates.append(Path(configured_root).expanduser())
+
+    # Prefer the historical local location while remaining portable across environments.
+    candidates.extend([
+        Path("/home/loc-llm/facefusion"),
+        Path("~/facefusion").expanduser(),
+        Path(__file__).resolve().parent.parent / "facefusion",
+    ])
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        except Exception:
+            continue
+
+    return candidates[0] if candidates else Path("/home/loc-llm/facefusion")
+
+
+IMAGER_ROOT = _resolve_imager_root()
 IMAGER_PYTHON = IMAGER_ROOT / ".venv" / "bin" / "python"
 IMAGER_SCRIPT = IMAGER_ROOT / "facefusion.py"
 IMAGER_SOURCE_DEFAULT = IMAGER_ROOT / "source_face.png"
@@ -120,7 +145,9 @@ IMAGER_ALLOWED_FACE_ENHANCER_MODELS = {"gfpgan_1.4"}
 IMAGER_LOG_DIR = Path("/tmp/kilo")
 IMAGER_INPUT_DIR = IMAGER_ROOT / "inputs"
 IMAGER_TARGET_MAX_BYTES = 50 * 1024 * 1024
+IMAGER_SOURCE_MAX_BYTES = 10 * 1024 * 1024
 IMAGER_ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
+IMAGER_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"}
 IMAGER_EXTRACTOR_HOSTS = {"instagram.com", "www.instagram.com", "instagr.am"}
 IMAGER_COOKIES_DIR = IMAGER_ROOT / "data" / "secrets" / "imager"
 IMAGER_COOKIES_PATH = IMAGER_COOKIES_DIR / "instagram-cookies.txt"
@@ -140,7 +167,7 @@ def _imager_variant_defaults(variant: str) -> dict[str, Any]:
         "face_selector_mode": "one",
         "face_selector_order": "best-worst",
         "face_mask_types": ["box", "occlusion"],
-        "face_mask_padding": [40, 40, 40, 40],
+        "face_mask_padding": [10, 10, 10, 10],
         "processors": ["face_swapper"],
         "face_swapper_model": "inswapper_128_fp16",
         "face_enhancer_model": "gfpgan_1.4",
@@ -185,7 +212,28 @@ def _merge_imager_config(payload: dict[str, Any]) -> tuple[dict[str, Any] | None
 
     for key in ["source_path", "target_path", "output_path", "execution_provider", "face_selector_mode", "face_selector_order", "face_swapper_model", "face_enhancer_model"]:
         if payload.get(key) is not None:
-            cfg[key] = str(payload.get(key)).strip()
+            if key == "target_path":
+                raw_target = payload.get(key)
+                if isinstance(raw_target, list):
+                    target_values: list[str] = []
+                    for index, item in enumerate(raw_target):
+                        if not isinstance(item, str):
+                            return None, f"target_path[{index}] must be a string URL/path."
+                        value = item.strip()
+                        if not value:
+                            return None, "target_path entries cannot be empty."
+                        target_values.append(value)
+                    if not target_values:
+                        return None, "target_path list cannot be empty."
+                    cfg["target_paths"] = target_values
+                elif isinstance(raw_target, str):
+                    cfg["target_path"] = str(raw_target).strip()
+                else:
+                    return None, "target_path must be a string URL/path or an array of strings."
+            elif isinstance(payload.get(key), str):
+                cfg[key] = str(payload.get(key)).strip()
+            else:
+                cfg[key] = payload.get(key)
 
     if payload.get("face_mask_types") is not None:
         if not isinstance(payload.get("face_mask_types"), list):
@@ -237,24 +285,42 @@ def _merge_imager_config(payload: dict[str, Any]) -> tuple[dict[str, Any] | None
     if quality < 1 or quality > 100:
         return None, "output_video_quality must be between 1 and 100."
 
-    for path_key in ["source_path", "target_path", "output_path"]:
+    for path_key in ["source_path", "output_path"]:
         value = str(cfg.get(path_key) or "").strip()
         if not value:
             return None, f"{path_key} is required."
         cfg[path_key] = str(Path(value).expanduser())
 
+    if "target_paths" not in cfg and "target_path" not in cfg:
+        return None, "target_path is required."
+    if "target_paths" not in cfg:
+        target_path = str(cfg.get("target_path") or "").strip()
+        if not target_path:
+            return None, "target_path is required."
+        cfg["target_paths"] = [str(Path(target_path).expanduser())]
+
     cfg["variant"] = variant
     return cfg, None
 
 
-def _imager_command_from_config(cfg: dict[str, Any]) -> list[str]:
+def _imager_command_from_config(cfg: dict[str, Any], *, target_path: str | None = None, output_path: str | None = None) -> list[str]:
+    cli_target = target_path
+    if cli_target is None:
+        cli_target = str(cfg.get("target_path") or "")
+    if not cli_target:
+        target_paths = cfg.get("target_paths")
+        if isinstance(target_paths, list) and target_paths:
+            cli_target = str(target_paths[0])
+    if not cli_target:
+        raise ValueError("target path is required")
+
     cmd = [
         str(IMAGER_PYTHON),
         str(IMAGER_SCRIPT),
         "headless-run",
         "--source-path", cfg["source_path"],
-        "--target-path", cfg["target_path"],
-        "--output-path", cfg["output_path"],
+        "--target-path", cli_target,
+        "--output-path", output_path if output_path is not None else cfg["output_path"],
         "--execution-providers", cfg["execution_provider"],
         "--face-selector-mode", cfg["face_selector_mode"],
         "--face-selector-order", cfg["face_selector_order"],
@@ -267,6 +333,554 @@ def _imager_command_from_config(cfg: dict[str, Any]) -> list[str]:
     if "face_enhancer" in cfg["processors"]:
         cmd.extend(["--face-enhancer-model", cfg["face_enhancer_model"]])
     return cmd
+
+
+def _normalize_imager_target_value(raw_target: Any) -> tuple[list[str] | None, str | None]:
+    def _extract_embedded_json_array(value: str) -> str | None:
+        start = value.find("[")
+        end = value.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        candidate = value[start:end + 1].strip()
+        if not candidate.startswith("[") or not candidate.endswith("]"):
+            return None
+        return candidate
+
+    def _parse_array_text(candidate: str, context: str) -> tuple[list[Any] | None, str | None]:
+        if not isinstance(candidate, str):
+            return None, f"{context} is not a JSON array text."
+
+        normalized_candidates: list[str] = []
+
+        base = candidate.strip()
+        if base:
+            normalized_candidates.append(base)
+
+        unescaped = base.replace("\\\"", '"')
+        if unescaped and unescaped not in normalized_candidates:
+            normalized_candidates.append(unescaped)
+
+        trailing_removed = re.sub(r",\s*]", "]", unescaped)
+        if trailing_removed and trailing_removed not in normalized_candidates:
+            normalized_candidates.append(trailing_removed)
+
+        last_error: Exception | None = None
+        for parse_text in normalized_candidates:
+            try:
+                loaded = json.loads(parse_text)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if not isinstance(loaded, list):
+                return None, f"{context} is not a JSON array."
+            return loaded, None
+
+        for parse_text in normalized_candidates:
+            try:
+                loaded = ast.literal_eval(parse_text)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if not isinstance(loaded, list):
+                return None, f"{context} is not a JSON array."
+            return loaded, None
+
+        if last_error is not None:
+            return None, f"{context} appears to be JSON array but failed to parse: {last_error}"
+        return None, f"{context} appears to be JSON array but failed to parse: unsupported format."
+
+    def _normalize_target_text(value: Any) -> str:
+        text = str(value or "").strip()
+        if len(text) >= 2 and ((text[0] == "'" and text[-1] == "'") or (text[0] == '"' and text[-1] == '"')):
+            text = text[1:-1].strip()
+
+        # Repair common clipboard/transport issues where https:/url may be injected
+        # as malformed single-slash scheme prefixes.
+        text = re.sub(r"^(https?):/([^/])", r"\1://\2", text)
+        return _ensure_http_like_url(text.replace("\u200b", "").strip())
+
+    def _normalize_target_item(value: Any, context: str) -> tuple[list[str] | None, str | None]:
+        if isinstance(value, list):
+            if not value:
+                return None, f"{context} cannot be empty."
+
+            normalized: list[str] = []
+            for idx, item in enumerate(value, start=1):
+                item_value, item_error = _normalize_target_item(item, context=f"{context}[{idx}]")
+                if item_error is not None:
+                    return None, item_error
+                normalized.extend(item_value or [])
+            if not normalized:
+                return None, "target_path entries cannot be empty."
+            return normalized, None
+
+        if not isinstance(value, str):
+            return None, f"{context} must be a string URL/path."
+
+        text = str(value or "").strip()
+        if not text:
+            return None, "target_path entries cannot be empty."
+
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                loaded, error = _parse_array_text(text, context=context)
+                if error is not None:
+                    return None, error
+            except Exception as exc:
+                return None, f"{context} appears to be JSON array but failed to parse: {exc}"
+
+            if not isinstance(loaded, list):
+                return None, f"{context} is not a JSON array."
+
+            return _normalize_target_item(loaded, context=context)
+
+        extracted = _extract_embedded_json_array(text)
+        if extracted is not None and extracted != text:
+            try:
+                loaded, error = _parse_array_text(extracted, context=context)
+                if error is not None:
+                    return None, error
+            except Exception as exc:
+                return None, f"{context} appears to be JSON array but failed to parse: {exc}"
+
+            if not isinstance(loaded, list):
+                return None, f"{context} is not a JSON array."
+
+            return _normalize_target_item(loaded, context=context)
+
+        normalized_text = _normalize_target_text(text)
+        if not normalized_text:
+            return None, "target_path entries cannot be empty."
+        return [normalized_text], None
+
+    if isinstance(raw_target, list):
+        if not raw_target:
+            return None, "target_path list cannot be empty."
+        out: list[str] = []
+        for idx, item in enumerate(raw_target):
+            item_value, item_error = _normalize_target_item(item, context=f"target_path[{idx}]")
+            if item_error is not None:
+                return None, item_error
+            out.extend(item_value or [])
+        return out, None
+
+    if isinstance(raw_target, str):
+        out, item_error = _normalize_target_item(raw_target, context="target_path")
+        if item_error is not None:
+            return None, item_error
+        if not out:
+            return None, "target_path is required."
+        return out, None
+
+    return None, "target_path must be a string URL/path or an array of strings."
+
+
+def _looks_like_http_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def _ensure_http_like_url(value: str) -> str:
+    text = str(value or "").strip().replace("\u200b", "")
+    if not text:
+        return text
+
+    if len(text) >= 2 and ((text[0] == "'" and text[-1] == "'") or (text[0] == '"' and text[-1] == '"')):
+        text = text[1:-1].strip()
+
+    parsed = urlparse(text)
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        return text
+
+    if text.startswith("//"):
+        return f"https:{text}"
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        return text
+    if text.startswith("www."):
+        return f"https://{text}"
+    if "instagram.com/" in text or "instagr.am/" in text:
+        return f"https://{text.lstrip('/')}"
+    return text
+
+
+def _build_imager_output_path(base_output: str, index: int) -> str:
+    base = Path(base_output)
+
+    if base.exists() and base.is_dir():
+        return str(base / f"output_{index}.mp4")
+
+    ext = base.suffix.lower()
+    if not ext:
+        ext = ".mp4"
+    stem = base.stem or "output"
+    parent = base.parent if str(base.parent) != "." else Path("")
+
+    if not base.suffix:
+        stem = base.name or "output"
+
+    return str(parent / f"{stem}_{index}{ext}")
+
+
+def _download_target_for_batch(target_url: str) -> tuple[str | None, dict[str, Any] | None, int]:
+    if _is_extractor_url(target_url):
+        output_path, download_error = _download_with_extractor(target_url)
+        if output_path is None and download_error is not None:
+            status_code = 400
+            if download_error.get("error_code") == "IMAGER_TARGET_TOO_LARGE":
+                status_code = 413
+            elif download_error.get("error_code") in {"IMAGER_EXTRACTOR_AUTH_REQUIRED", "IMAGER_EXTRACTOR_AUTH_FAILED"}:
+                status_code = 401
+            elif download_error.get("error_code") in {"IMAGER_EXTRACTOR_OUTPUT_INVALID", "IMAGER_EXTRACTOR_MISSING", "IMAGER_EXTRACTOR_OUTPUT_MISSING", "IMAGER_EXTRACTOR_FAILED", "IMAGER_EXTRACTOR_AUTH_FAILED", "IMAGER_EXTRACTOR_AUTH_REQUIRED"}:
+                status_code = 502
+            return None, download_error, status_code
+        if output_path is not None:
+            return str(output_path), None, 0
+
+    source_url = target_url
+    parsed = urlparse(source_url)
+    if parsed.scheme not in {"http", "https"}:
+        return None, {"ok": False, "error": "Only http/https URLs are supported.", "error_code": "IMAGER_TARGET_URL_INVALID"}, 400
+
+    is_public, host_error = _is_public_http_host(parsed.hostname or "")
+    if not is_public:
+        return None, {"ok": False, "error": host_error or "URL host is not allowed.", "error_code": "IMAGER_TARGET_URL_BLOCKED"}, 400
+
+    IMAGER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        current_url = source_url
+        redirects_followed = 0
+        max_redirects = 5
+        while True:
+            current_parsed = urlparse(current_url)
+            if current_parsed.scheme not in {"http", "https"}:
+                return None, {"ok": False, "error": "Redirect target uses unsupported scheme.", "error_code": "IMAGER_TARGET_URL_INVALID"}, 400
+            is_public, host_error = _is_public_http_host(current_parsed.hostname or "")
+            if not is_public:
+                return None, {"ok": False, "error": host_error or "Redirect target host is not allowed.", "error_code": "IMAGER_TARGET_URL_BLOCKED"}, 400
+
+            resp = requests.get(current_url, stream=True, timeout=(10, 180), allow_redirects=False)
+            status_code = resp.status_code
+            if status_code in {301, 302, 303, 307, 308}:
+                location = str(resp.headers.get("location") or "").strip()
+                resp.close()
+                if not location:
+                    return None, {"ok": False, "error": "Redirect response missing Location header.", "error_code": "IMAGER_TARGET_DOWNLOAD_HTTP_ERROR", "status_code": status_code}, 502
+                if redirects_followed >= max_redirects:
+                    return None, {"ok": False, "error": "Too many redirects while downloading URL.", "error_code": "IMAGER_TARGET_TOO_MANY_REDIRECTS"}, 502
+                current_url = requests.compat.urljoin(current_url, location)
+                redirects_followed += 1
+                continue
+            break
+
+        with resp:
+            status_code = resp.status_code
+            if status_code >= 400:
+                return None, {"ok": False, "error": f"Download failed with HTTP {status_code}.", "error_code": "IMAGER_TARGET_DOWNLOAD_HTTP_ERROR", "status_code": status_code}, 502
+
+            final_url = str(resp.url or current_url or source_url)
+            final_parsed = urlparse(final_url)
+            hinted_name = Path(final_parsed.path).name or "downloaded-video"
+            content_type = str(resp.headers.get("content-type") or "")
+            content_length_header = resp.headers.get("content-length")
+
+            if content_length_header:
+                try:
+                    expected_size = int(content_length_header)
+                    if expected_size > IMAGER_TARGET_MAX_BYTES:
+                        return None, {"ok": False, "error": "Remote file exceeds 50MB limit.", "error_code": "IMAGER_TARGET_TOO_LARGE"}, 413
+                except Exception:
+                    pass
+
+            raw_ext = Path(hinted_name).suffix.lower()
+            is_video_content_type = content_type.lower().startswith("video/")
+            if not is_video_content_type:
+                return None, {
+                    "ok": False,
+                    "error": "URL response is not a video content type.",
+                    "error_code": "IMAGER_TARGET_URL_NOT_VIDEO",
+                    "content_type": content_type,
+                }, 400
+
+            ext = raw_ext if raw_ext in IMAGER_ALLOWED_VIDEO_EXTENSIONS else _detect_extension_from_content_type(content_type)
+
+            out_name = _ensure_video_filename(f"downloaded-{int(time.time())}-{hinted_name}", ext)
+            output_path = IMAGER_INPUT_DIR / out_name
+
+            total = 0
+            with output_path.open("wb") as handle:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > IMAGER_TARGET_MAX_BYTES:
+                        handle.close()
+                        try:
+                            output_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return None, {"ok": False, "error": "Remote file exceeds 50MB limit.", "error_code": "IMAGER_TARGET_TOO_LARGE"}, 413
+                    handle.write(chunk)
+
+            return str(output_path), None, 0
+    except requests.RequestException as exc:
+        return None, {"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED"}, 502
+    except Exception as exc:
+        return None, {"ok": False, "error": repr(exc), "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED"}, 500
+
+
+def _resolve_imager_targets(target_values: list[str]) -> tuple[list[str] | None, dict[str, Any] | None, int | None]:
+    normalized_targets, normalize_error = _normalize_imager_target_value(target_values)
+    if normalize_error:
+        return None, {
+            "ok": False,
+            "error": normalize_error,
+            "error_code": "IMAGER_TARGET_URL_INVALID",
+            "phase": "resolve_targets",
+            "target_index": 1,
+            "target": str(target_values),
+        }, 400
+
+    if not normalized_targets:
+        return None, {
+            "ok": False,
+            "error": "target_path entries cannot be empty.",
+            "error_code": "IMAGER_TARGET_MISSING",
+            "phase": "resolve_targets",
+            "target_index": 1,
+            "target": str(target_values),
+        }, 400
+
+    resolved: list[str] = []
+    for index, raw_target in enumerate(normalized_targets, start=1):
+        try:
+            target_text = _ensure_http_like_url(str(raw_target or "").strip())
+            if not target_text:
+                return None, {
+                    "ok": False,
+                    "error": f"target entry #{index} is empty.",
+                    "error_code": "IMAGER_TARGET_MISSING",
+                    "phase": "resolve_targets",
+                    "target_index": index,
+                    "target": target_text,
+                }, 400
+
+            if _looks_like_http_url(target_text):
+                try:
+                    target_path, target_error, status_code = _download_target_for_batch(target_text)
+                except Exception as exc:
+                    return None, {
+                        "ok": False,
+                        "error": f"Failed to resolve remote target #{index}: {exc}",
+                        "error_code": "IMAGER_TARGET_DOWNLOAD_FAILED",
+                        "exception_type": type(exc).__name__,
+                        "exception": repr(exc),
+                        "phase": "resolve_targets",
+                        "target_index": index,
+                        "target": target_text,
+                        "target_type": "remote",
+                    }, 502
+
+                if target_error is not None:
+                    error_payload = dict(target_error)
+                    error_payload.update({
+                        "ok": False,
+                        "phase": "resolve_targets",
+                        "target_index": index,
+                        "target": target_text,
+                        "target_type": "remote",
+                    })
+                    if "error" not in error_payload:
+                        error_payload["error"] = "Failed to download target URL."
+                    return None, error_payload, status_code
+                assert target_path is not None
+                resolved.append(target_path)
+                continue
+
+            resolved_path = Path(target_text).expanduser()
+            if not resolved_path.exists() or not resolved_path.is_file():
+                return None, {
+                    "ok": False,
+                    "error": f"Target entry #{index} is missing: {target_text}",
+                    "error_code": "IMAGER_TARGET_MISSING",
+                    "phase": "resolve_targets",
+                    "target_index": index,
+                    "target": target_text,
+                    "target_type": "local",
+                }, 400
+        except ValueError as exc:
+            return None, {
+                "ok": False,
+                "error": f"Invalid target entry #{index}: {exc}",
+                "error_code": "IMAGER_TARGET_URL_INVALID",
+                "exception_type": type(exc).__name__,
+                "exception": repr(exc),
+                "phase": "resolve_targets",
+                "target_index": index,
+                "target": str(raw_target),
+            }, 400
+
+        resolved.append(str(resolved_path))
+
+    return resolved, None, None
+
+
+def _run_imager_batch_job(batch_id: str, items: list[dict[str, Any]], cfg: dict[str, Any], initial_batch_start: str) -> None:
+    completed = 0
+    failures = 0
+
+    for item in items:
+        if not item:
+            continue
+
+        with IMAGER_STATE_LOCK:
+            _refresh_imager_state_locked()
+            current = IMAGER_STATE.get("current")
+            if not current:
+                return
+            if current.get("batch_id") != batch_id:
+                return
+            if current.get("stop_requested"):
+                current["status"] = "stopped"
+                current["finished_at"] = now_iso()
+                current.pop("process", None)
+                IMAGER_STATE["current"] = current
+                IMAGER_STATE["last"] = {**current}
+                return
+
+            output_path = str(item.get("output_path") or cfg["output_path"])
+            target_path = str(item.get("target_path") or cfg["target_paths"][0])
+            item_index = int(item.get("item_index") or 0)
+            command = _imager_command_from_config(cfg, target_path=target_path, output_path=output_path)
+            log_path = Path(str(item.get("log_path") or IMAGER_LOG_DIR / f"facefusion-{batch_id}-{item_index}.log"))
+            run_id = str(item.get("run_id") or f"{batch_id}-{item_index}")
+            is_remote = bool(item.get("is_remote"))
+
+            current.update(
+                {
+                    "run_id": run_id,
+                    "batch_id": batch_id,
+                    "current_item_index": item_index,
+                    "items_total": len(items),
+                    "items_completed": completed,
+                    "item_status": "downloading" if is_remote else "running",
+                    "status": "queued" if is_remote else "running",
+                    "started_at": now_iso(),
+                    "finished_at": None,
+                    "exit_code": None,
+                    "pid": None,
+                    "log_path": str(log_path),
+                    "source_path": cfg["source_path"],
+                    "target_path": target_path,
+                    "output_path": output_path,
+                    "command": command,
+                    "is_remote": is_remote,
+                    "source_target": str(item.get("source_target") or target_path),
+                    "item_error": None,
+                    "config": cfg,
+                }
+            )
+
+            try:
+                log_handle = log_path.open("w", encoding="utf-8")
+            except Exception as exc:
+                current["status"] = "failed"
+                current["finished_at"] = now_iso()
+                current["item_error"] = repr(exc)
+                failures += 1
+                completed += 1
+                IMAGER_STATE["current"] = current
+                continue
+
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(IMAGER_ROOT),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception as exc:
+                log_handle.close()
+                current["status"] = "failed"
+                current["finished_at"] = now_iso()
+                current["item_error"] = repr(exc)
+                failures += 1
+                completed += 1
+                IMAGER_STATE["current"] = current
+                continue
+
+            current["process"] = process
+            current["pid"] = process.pid
+            current["status"] = "running"
+            current["item_status"] = "running"
+            IMAGER_STATE["current"] = current
+
+        exit_code = process.wait()
+        log_handle.close()
+
+        with IMAGER_STATE_LOCK:
+            _refresh_imager_state_locked()
+            current = IMAGER_STATE.get("current")
+            if not current:
+                return
+            if current.get("batch_id") != batch_id:
+                return
+
+            completed += 1
+            if current.get("stop_requested") or current.get("status") == "stopping":
+                current["status"] = "stopped"
+                current["item_error"] = f"Item #{item_index} stopped by user."
+            elif exit_code == 0:
+                current["status"] = "success"
+            else:
+                current["status"] = "failed"
+                failures += 1
+                current["item_error"] = f"Item #{item_index} failed with exit code {exit_code}."
+
+            current["finished_at"] = now_iso()
+            current["exit_code"] = exit_code
+            current.pop("process", None)
+            current["items_completed"] = completed
+            IMAGER_STATE["current"] = current
+
+            item_summary = {**current}
+            item_summary["batch_completed"] = completed
+            item_summary["batch_failures"] = failures
+            IMAGER_STATE["last"] = item_summary
+
+    with IMAGER_STATE_LOCK:
+        _refresh_imager_state_locked()
+        current = IMAGER_STATE.get("current")
+        if not current:
+            return
+        if current.get("batch_id") != batch_id:
+            return
+
+        if current.get("status") == "stopped":
+            IMAGER_STATE["current"] = current
+            return
+
+        status = "failed" if failures > 0 else "success"
+        IMAGER_STATE["current"] = {
+            "batch_id": batch_id,
+            "run_id": batch_id,
+            "status": status,
+            "variant": cfg.get("variant"),
+            "items_total": len(items),
+            "items_completed": completed,
+            "batch_failures": failures,
+            "started_at": initial_batch_start,
+            "finished_at": now_iso(),
+            "source_path": cfg["source_path"],
+            "target_path": None,
+            "output_path": cfg["output_path"],
+            "log_path": IMAGER_STATE["last"].get("log_path") if isinstance(IMAGER_STATE.get("last"), dict) else None,
+            "command": _imager_command_from_config(cfg),
+            "error_code": None,
+        }
+
+        IMAGER_STATE["last"] = IMAGER_STATE["current"]
+        IMAGER_STATE["current"] = None
 
 
 def _validate_netscape_cookie_file(content: str) -> tuple[bool, str | None]:
@@ -339,7 +953,12 @@ def _refresh_imager_state_locked() -> None:
     current["finished_at"] = now_iso()
     current.pop("process", None)
     IMAGER_STATE["last"] = current
-    IMAGER_STATE["current"] = None
+
+    # Keep the running batch job in place until the worker finalizer updates
+    # the full batch summary. This avoids status polling clearing current state
+    # too early during per-item transitions.
+    if not isinstance(current.get("batch_items"), list):
+        IMAGER_STATE["current"] = None
 
 
 def _imager_status_payload() -> dict[str, Any]:
@@ -367,6 +986,7 @@ def _imager_status_payload() -> dict[str, Any]:
             "facefusion_root": str(IMAGER_ROOT),
             "inputs_root": str(IMAGER_INPUT_DIR),
             "target_max_bytes": IMAGER_TARGET_MAX_BYTES,
+            "source_max_bytes": IMAGER_SOURCE_MAX_BYTES,
             "cookies_path": str(IMAGER_COOKIES_PATH),
             "cookies_exists": cookies_exists,
             "cookies_size_bytes": cookies_size,
@@ -419,6 +1039,14 @@ def _sanitize_upload_name(name: str) -> str:
     return cleaned
 
 
+def _ensure_image_filename(name: str, fallback_ext: str = ".png") -> str:
+    cleaned = _sanitize_upload_name(name)
+    ext = Path(cleaned).suffix.lower()
+    if ext not in IMAGER_ALLOWED_IMAGE_EXTENSIONS:
+        cleaned = f"{Path(cleaned).stem or 'image'}{fallback_ext}"
+    return cleaned
+
+
 def _ensure_video_filename(name: str, fallback_ext: str = ".mp4") -> str:
     cleaned = _sanitize_upload_name(name)
     ext = Path(cleaned).suffix.lower()
@@ -452,12 +1080,6 @@ def _extract_public_instagram_video_url(source_url: str) -> str | None:
     candidates.append(f"{base}/embed?__a=1")
     candidates.append(f"{base}/?__a=1&__d=dis")
 
-    request_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    }
-
     patterns = [
         re.compile(r'<meta property="og:video" content="([^"]+)"', re.IGNORECASE),
         re.compile(r'<meta property="og:video:secure_url" content="([^"]+)"', re.IGNORECASE),
@@ -472,7 +1094,7 @@ def _extract_public_instagram_video_url(source_url: str) -> str | None:
 
     for candidate_url in candidates:
         try:
-            response = requests.get(candidate_url, headers=request_headers, timeout=(8, 20), allow_redirects=True)
+            response = requests.get(candidate_url, timeout=(8, 20), allow_redirects=True)
         except requests.RequestException:
             continue
 
@@ -482,13 +1104,121 @@ def _extract_public_instagram_video_url(source_url: str) -> str | None:
                 continue
 
             body = html.unescape(response.text or "")
+            normalized_body = body.replace("\\\"", '"')
+            for _ in range(3):
+                normalized_body = normalized_body.replace("\\/", "/")
             for pattern in patterns:
-                match = pattern.search(body)
+                match = pattern.search(normalized_body)
                 if not match:
                     continue
-                url = html.unescape((match.group(1) or "").strip()).replace("\\/", "/")
+                url = html.unescape((match.group(1) or "").strip())
+                for _ in range(3):
+                    url = url.replace("\\/", "/")
                 if url and _looks_like_video_url(url):
                     return url
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    return None
+
+
+def _extract_meta_tag_values(html_text: str, keys: list[str]) -> dict[str, str]:
+    """Extract meta tag values for the requested names/keys.
+
+    Supports name/property attributes and content-first or key-first ordering.
+    """
+    wanted = {str(k or "").lower() for k in keys}
+    values: dict[str, str] = {}
+
+    if not html_text:
+        return values
+
+    patterns = [
+        re.compile(r"<meta[^>]+(?:name|property)=\"(?P<key>[^\"]+)\"[^>]+content=\"(?P<value>[^\"]+)\"", re.IGNORECASE),
+        re.compile(r"<meta[^>]+(?:name|property)='(?P<key>[^']+)'[^>]+content='(?P<value>[^']+)'", re.IGNORECASE),
+        re.compile(r"<meta[^>]+content=\"(?P<value>[^\"]+)\"[^>]+(?:name|property)=\"(?P<key>[^\"]+)\"", re.IGNORECASE),
+        re.compile(r"<meta[^>]+content='(?P<value>[^']+)'[^>]+(?:name|property)='(?P<key>[^']+)'", re.IGNORECASE),
+    ]
+
+    for pattern in patterns:
+        for match in pattern.finditer(html_text):
+            key = (match.group("key") or "").lower()
+            if key not in wanted:
+                continue
+            value = (match.group("value") or "").strip()
+            if value:
+                values[key] = html.unescape(value)
+
+    return values
+
+
+def _is_public_instagram_post_video(source_url: str) -> bool | None:
+    """Best-effort heuristic to tell if an Instagram post appears to be video."""
+    candidates = [source_url]
+    if source_url.endswith("/"):
+        base = source_url[:-1]
+    else:
+        base = source_url
+    candidates.append(f"{base}/embed")
+    candidates.append(f"{base}/?output=1")
+    candidates.append(f"{base}/embed/")
+
+    for candidate_url in candidates:
+        try:
+            response = requests.get(candidate_url, timeout=(8, 20), allow_redirects=True)
+        except requests.RequestException:
+            continue
+
+        try:
+            if response.status_code < 200 or response.status_code >= 400:
+                continue
+
+            body = html.unescape(response.text or "")
+            normalized_body = body.replace("\\\"", '"')
+            for _ in range(3):
+                normalized_body = normalized_body.replace("\\/", "/")
+
+            meta = _extract_meta_tag_values(
+                normalized_body,
+                [
+                    "og:type",
+                    "og:image",
+                    "og:image:secure_url",
+                    "og:image:url",
+                    "og:video",
+                    "og:video:secure_url",
+                    "og:video:url",
+                    "twitter:card",
+                    "twitter:image",
+                    "twitter:player",
+                    "twitter:player:width",
+                    "twitter:player:height",
+                ],
+            )
+
+            body_lower = normalized_body.lower()
+
+            if "\"is_video\":true" in body_lower or "'is_video': true" in body_lower:
+                return True
+            if "\"is_video\":false" in body_lower or "'is_video': false" in body_lower:
+                return False
+
+            if meta.get("og:video") or meta.get("og:video:secure_url") or meta.get("og:video:url"):
+                return True
+
+            twitter_card = (meta.get("twitter:card") or "").lower()
+            if twitter_card == "player":
+                return True
+
+            og_type = (meta.get("og:type") or "").lower()
+            if og_type in {"video", "video.other", "video.movie", "video.episode"}:
+                return True
+
+            if _looks_like_video_url(response.url or ""):
+                return True
         finally:
             try:
                 response.close()
@@ -627,8 +1357,8 @@ def _is_public_http_host(hostname: str) -> tuple[bool, str | None]:
 
     try:
         addr_info = socket.getaddrinfo(host, None)
-    except Exception:
-        return False, "Unable to resolve URL host."
+    except Exception as exc:
+        return False, f"Unable to resolve URL host: {host}. ({type(exc).__name__}: {exc})"
 
     if not addr_info:
         return False, "Unable to resolve URL host."
@@ -714,6 +1444,13 @@ def _download_with_extractor(source_url: str) -> tuple[Path | None, dict[str, An
                     return public_path, None
                 if isinstance(public_error, dict):
                     return None, public_error
+            is_post_video = _is_public_instagram_post_video(source_url)
+            if is_post_video is False:
+                return None, {
+                    "ok": False,
+                    "error": "Instagram URL does not appear to contain a downloadable video.",
+                    "error_code": "IMAGER_TARGET_URL_NOT_VIDEO",
+                }
             return None, {
                 "ok": False,
                 "error": "Instagram requires authenticated cookies for this URL. Upload a cookies.txt export and retry.",
@@ -2343,10 +3080,73 @@ def api_imager_target_upload():
     })
 
 
+@app.route("/api/imager/source/upload", methods=["POST"])
+def api_imager_source_upload():
+    content_length = request.content_length or 0
+    if content_length > IMAGER_SOURCE_MAX_BYTES:
+        return jsonify({
+            "ok": False,
+            "error": "Upload exceeds 10MB limit.",
+            "error_code": "IMAGER_SOURCE_TOO_LARGE",
+        }), 413
+
+    file_storage = request.files.get("source_image")
+    if not file_storage or not file_storage.filename:
+        return jsonify({
+            "ok": False,
+            "error": "Missing uploaded file field: source_image.",
+            "error_code": "IMAGER_SOURCE_UPLOAD_MISSING",
+        }), 400
+
+    source_name = _sanitize_upload_name(file_storage.filename)
+    src_ext = Path(source_name).suffix.lower()
+    if src_ext and src_ext not in IMAGER_ALLOWED_IMAGE_EXTENSIONS:
+        return jsonify({
+            "ok": False,
+            "error": "Unsupported image extension.",
+            "error_code": "IMAGER_SOURCE_UPLOAD_UNSUPPORTED",
+        }), 400
+
+    IMAGER_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    file_ext = src_ext if src_ext in IMAGER_ALLOWED_IMAGE_EXTENSIONS else ".png"
+    out_name = _ensure_image_filename(f"uploaded-{int(time.time())}-{source_name}", file_ext)
+    output_path = IMAGER_INPUT_DIR / out_name
+
+    total = 0
+    try:
+        with output_path.open("wb") as handle:
+            while True:
+                chunk = file_storage.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > IMAGER_SOURCE_MAX_BYTES:
+                    handle.close()
+                    try:
+                        output_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return jsonify({
+                        "ok": False,
+                        "error": "Upload exceeds 10MB limit.",
+                        "error_code": "IMAGER_SOURCE_TOO_LARGE",
+                    }), 413
+                handle.write(chunk)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_SOURCE_UPLOAD_FAILED"}), 500
+
+    return jsonify({
+        "ok": True,
+        "source_path": str(output_path),
+        "size_bytes": total,
+        "message": "Uploaded source image is ready.",
+    })
+
+
 @app.route("/api/imager/target/download", methods=["POST"])
 def api_imager_target_download():
     body = request.get_json(silent=True) or {}
-    source_url = str(body.get("url") or "").strip()
+    source_url = _ensure_http_like_url(str(body.get("url") or "").strip())
     if not source_url:
         return jsonify({"ok": False, "error": "url is required.", "error_code": "IMAGER_TARGET_URL_REQUIRED"}), 400
 
@@ -2364,6 +3164,8 @@ def api_imager_target_download():
             error_code = str(extractor_error.get("error_code") or "")
             if error_code == "IMAGER_TARGET_TOO_LARGE":
                 status = 413
+            elif error_code == "IMAGER_TARGET_URL_NOT_VIDEO":
+                status = 400
             elif error_code in {"IMAGER_EXTRACTOR_AUTH_REQUIRED", "IMAGER_EXTRACTOR_AUTH_FAILED"}:
                 status = 401
             elif error_code == "IMAGER_EXTRACTOR_MISSING":
@@ -2493,85 +3295,138 @@ def api_imager_target_download():
 
 @app.route("/api/imager/run", methods=["POST"])
 def api_imager_run():
-    if not IMAGER_PYTHON.exists() or not IMAGER_SCRIPT.exists():
-        return jsonify({
-            "ok": False,
-            "error": "FaceFusion runtime is missing. Verify ~/facefusion and .venv setup.",
-            "error_code": "IMAGER_RUNTIME_MISSING",
-        }), 400
-
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body, dict):
-        return jsonify({"ok": False, "error": "Request body must be a JSON object.", "error_code": "IMAGER_INVALID_BODY"}), 400
-
-    cfg, cfg_error = _merge_imager_config(body)
-    if cfg_error:
-        return jsonify({"ok": False, "error": cfg_error, "error_code": "IMAGER_INVALID_CONFIG"}), 400
-    assert cfg is not None
-
-    source = Path(cfg["source_path"])
-    target = Path(cfg["target_path"])
-    output = Path(cfg["output_path"])
-    if not source.exists() or not source.is_file():
-        return jsonify({"ok": False, "error": f"Source image missing: {source}", "error_code": "IMAGER_SOURCE_MISSING"}), 400
-    if not target.exists() or not target.is_file():
-        return jsonify({"ok": False, "error": f"Target video missing: {target}", "error_code": "IMAGER_TARGET_MISSING"}), 400
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    command = _imager_command_from_config(cfg)
-    run_id = uuid.uuid4().hex[:12]
-    log_path = IMAGER_LOG_DIR / f"facefusion-{run_id}.log"
-
-    with IMAGER_STATE_LOCK:
-        _refresh_imager_state_locked()
-        if IMAGER_STATE.get("current") is not None:
-            current = IMAGER_STATE.get("current") or {}
+    target_values: list[str] | None = None
+    resolved_targets: list[str] | None = None
+    try:
+        if not IMAGER_PYTHON.exists() or not IMAGER_SCRIPT.exists():
             return jsonify({
                 "ok": False,
-                "error": "An imager run is already in progress.",
-                "error_code": "IMAGER_ALREADY_RUNNING",
-                "current_run_id": current.get("run_id"),
-            }), 409
+                "error": "FaceFusion runtime is missing. Verify ~/facefusion and .venv setup.",
+                "error_code": "IMAGER_RUNTIME_MISSING",
+            }), 400
 
-        try:
-            with log_path.open("w", encoding="utf-8") as log_handle:
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(IMAGER_ROOT),
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-        except Exception as exc:
-            return jsonify({"ok": False, "error": repr(exc), "error_code": "IMAGER_SPAWN_FAILED"}), 500
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Request body must be a JSON object.", "error_code": "IMAGER_INVALID_BODY"}), 400
 
-        job = {
-            "run_id": run_id,
+        cfg, cfg_error = _merge_imager_config(body)
+        if cfg_error:
+            return jsonify({"ok": False, "error": cfg_error, "error_code": "IMAGER_INVALID_CONFIG"}), 400
+        assert cfg is not None
+
+        target_values, target_error = _normalize_imager_target_value(cfg.get("target_paths") or cfg.get("target_path"))
+        if target_error:
+            return jsonify({"ok": False, "error": target_error, "error_code": "IMAGER_INVALID_TARGET"}), 400
+        assert target_values is not None
+
+        resolved_targets, resolve_error, resolve_status = _resolve_imager_targets(target_values)
+        if resolve_error:
+            status_code = int(resolve_status or 400)
+            error_code = str(resolve_error.get("error_code") or "IMAGER_TARGET_RESOLVE_FAILED")
+            response_payload: dict[str, Any] = {
+                "ok": False,
+                "error": resolve_error.get("error") or "Failed to resolve one or more targets.",
+                "error_code": error_code,
+                "error_detail": resolve_error,
+                "resolved_count": len([] if resolved_targets is None else resolved_targets),
+                "requested_count": len(target_values),
+                "phase": "resolve_targets",
+            }
+            return jsonify(response_payload), status_code
+        assert resolved_targets is not None
+
+        source = Path(cfg["source_path"])
+        if not source.exists() or not source.is_file():
+            return jsonify({"ok": False, "error": f"Source image missing: {source}", "error_code": "IMAGER_SOURCE_MISSING"}), 400
+
+        output = Path(cfg["output_path"])
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        batch_id = uuid.uuid4().hex[:12]
+        batch_started_at = now_iso()
+        batch_items: list[dict[str, Any]] = []
+        for index, (target_source, target_path) in enumerate(zip(target_values, resolved_targets), start=1):
+            item_output = str(output)
+            if len(resolved_targets) > 1:
+                item_output = _build_imager_output_path(str(output), index)
+            batch_items.append({
+                "item_index": index,
+                "run_id": f"{batch_id}-{index}",
+                "source_target": str(target_source),
+                "is_remote": _looks_like_http_url(str(target_source)),
+                "target_path": str(Path(target_path).expanduser()),
+                "output_path": item_output,
+                "log_path": str(IMAGER_LOG_DIR / f"facefusion-{batch_id}-{index}.log"),
+            })
+
+        first_item = batch_items[0]
+
+        with IMAGER_STATE_LOCK:
+            _refresh_imager_state_locked()
+            if IMAGER_STATE.get("current") is not None:
+                current = IMAGER_STATE.get("current") or {}
+                return jsonify({
+                    "ok": False,
+                    "error": "An imager run is already in progress.",
+                    "error_code": "IMAGER_ALREADY_RUNNING",
+                    "current_run_id": current.get("run_id"),
+                    "current_batch_id": current.get("batch_id"),
+                }), 409
+
+            IMAGER_STATE["current"] = {
+                "batch_id": batch_id,
+                "run_id": batch_id,
+                "status": "queued",
+                "item_status": "downloading" if first_item.get("is_remote") else "running",
+                "variant": cfg.get("variant"),
+                "items_total": len(batch_items),
+                "items_completed": 0,
+                "batch_failures": 0,
+                "source_path": cfg["source_path"],
+                "target_path": first_item["target_path"],
+                "source_target": first_item.get("source_target"),
+                "is_remote": first_item.get("is_remote"),
+                "output_path": first_item["output_path"],
+                "command": _imager_command_from_config(cfg, target_path=first_item["target_path"], output_path=first_item["output_path"]),
+                "config": cfg,
+                "current_item_index": 1,
+                "started_at": batch_started_at,
+                "finished_at": None,
+                "exit_code": None,
+                "pid": None,
+                "log_path": first_item["log_path"],
+                "item_error": None,
+                "batch_items": batch_items,
+            }
+
+        worker = Thread(
+            target=_run_imager_batch_job,
+            args=(batch_id, batch_items, cfg, batch_started_at),
+            daemon=True,
+        )
+        worker.start()
+
+        return jsonify({
+            "ok": True,
+            "run_id": batch_id,
+            "batch_id": batch_id,
             "status": "running",
-            "variant": cfg.get("variant"),
-            "started_at": now_iso(),
-            "finished_at": None,
-            "exit_code": None,
-            "pid": process.pid,
-            "log_path": str(log_path),
-            "source_path": cfg["source_path"],
-            "target_path": cfg["target_path"],
-            "output_path": cfg["output_path"],
-            "command": command,
-            "config": cfg,
-            "process": process,
-        }
-        IMAGER_STATE["current"] = job
-
-    return jsonify({
-        "ok": True,
-        "run_id": run_id,
-        "status": "running",
-        "output_path": cfg["output_path"],
-        "log_path": str(log_path),
-        "started_at": now_iso(),
-        "command": command,
-    }), 202
+            "batch_total": len(batch_items),
+            "output_path": first_item["output_path"],
+            "log_path": first_item["log_path"],
+            "started_at": batch_started_at,
+            "command": _imager_command_from_config(cfg, target_path=first_item["target_path"], output_path=first_item["output_path"]),
+        }), 202
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "Unexpected error while starting imager run.",
+            "error_code": "IMAGER_RUN_INTERNAL_ERROR",
+            "exception": repr(exc),
+            "exception_type": type(exc).__name__,
+            "target_count": len(target_values) if isinstance(target_values, list) else None,
+            "resolved_count": len(resolved_targets) if isinstance(resolved_targets, list) else None,
+        }), 500
 
 
 @app.route("/api/imager/stop", methods=["POST"])
@@ -2582,9 +3437,23 @@ def api_imager_stop():
         if not current:
             return jsonify({"ok": False, "error": "No imager run is active.", "error_code": "IMAGER_NOT_RUNNING"}), 400
 
+        batch_items = current.get("batch_items")
+        if batch_items:
+            current["stop_requested"] = True
+
         process: subprocess.Popen[str] | None = current.get("process")
         if process is None:
-            return jsonify({"ok": False, "error": "No live process found for current run.", "error_code": "IMAGER_PROCESS_MISSING"}), 400
+            current["status"] = "stopped"
+            current["exit_code"] = 0
+            current["stop_requested"] = True
+            current["finished_at"] = now_iso()
+            current.pop("process", None)
+            IMAGER_STATE["last"] = current
+            IMAGER_STATE["current"] = None
+            return jsonify({"ok": True, "status": "stopped", "run_id": current.get("run_id"), "exit_code": 0, "finished_at": current.get("finished_at")})
+
+        current["status"] = "stopping"
+        current["stop_requested"] = True
 
         try:
             process.terminate()
@@ -2616,11 +3485,22 @@ def api_imager_logs():
 
         run_id = str(request.args.get("run_id") or "").strip()
         selected = None
+        selected_by_batch = False
         for candidate in [current, last]:
             if not candidate:
                 continue
-            if not run_id or str(candidate.get("run_id")) == run_id:
+            candidate_run_id = str(candidate.get("run_id") or "")
+            candidate_batch_id = str(candidate.get("batch_id") or "")
+            if not run_id:
                 selected = candidate
+                break
+            if candidate_run_id == run_id:
+                selected = candidate
+                selected_by_batch = False
+                break
+            if candidate_batch_id == run_id:
+                selected = candidate
+                selected_by_batch = True
                 break
 
     if not selected:
@@ -2639,9 +3519,11 @@ def api_imager_logs():
     return jsonify({
         "ok": True,
         "run_id": selected.get("run_id"),
+        "batch_id": selected.get("batch_id"),
         "status": selected.get("status"),
         "log_path": str(log_path),
         "truncated": len(raw) > len(clipped),
+        "selected_by": "batch_id" if selected_by_batch else "run_id",
         "output": clipped,
     })
 
