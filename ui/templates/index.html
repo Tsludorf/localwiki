@@ -13,7 +13,6 @@
         <h1>Local AI Health Dashboard</h1>
         <p class="subtitle">Simple health view of your local AI services</p>
       </div>
-      <a class="nav-link" href="/imager">Open Imager Webscraper</a>
       <button id="refreshBtn">Refresh now</button>
       <button id="restartAllBtn" class="secondary">Restart all services</button>
       <button id="restartUiBtn" class="secondary">Restart UI service</button>
@@ -30,14 +29,18 @@
         Services
         <span id="servicesTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
       </button>
-      <button class="tab" data-tab-target="localwikiTab">
-        LocalWiki
-        <span id="localwikiTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
-      </button>
-      <button class="tab" data-tab-target="factsetTab">
-        FactSet OAuth
-        <span id="factsetTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
-      </button>
+       <button class="tab" data-tab-target="localwikiTab">
+         LocalWiki
+         <span id="localwikiTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+       </button>
+       <button class="tab" data-tab-target="managementQuotesTab">
+         Management Quotes
+         <span id="managementQuotesTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+       </button>
+       <button class="tab" data-tab-target="factsetTab">
+         FactSet OAuth
+         <span id="factsetTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
+       </button>
       <button class="tab" data-tab-target="factsetSdkTab">
         FactSet SDK
         <span id="factsetSdkTabStatus" class="tab-dot tab-dot-bad" aria-hidden="true"></span>
@@ -87,6 +90,87 @@
         <h2>LocalWiki Loaded Files</h2>
         <div id="localwikiSummary" class="quick-stats"></div>
         <div id="localwikiSources" class="cards"></div>
+      </section>
+    </section>
+
+    <section id="managementQuotesTab" class="tab-panel">
+      <section>
+        <h2>Management Quotes Sync</h2>
+        <p class="help">Fetch and cache management transcript data.</p>
+        <div class="status-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); max-width: 100%;">
+          <label><strong>Ticker ID</strong><input id="mqSyncTickerId" type="text" value="" /></label>
+          <label><strong>Years</strong><input id="mqSyncYears" type="number" min="1" max="20" value="5" /></label>
+          <label><strong>Sleep (seconds)</strong><input id="mqSyncSleepSeconds" type="number" min="0" max="300" step="0.1" value="0.5" /></label>
+          <label class="check-inline"><input id="mqSyncDryRun" type="checkbox" /> Dry run</label>
+        </div>
+        <div class="cli-toolbar">
+          <button id="mqSyncBtn">Run sync</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Management Quotes Extract</h2>
+        <p class="help">Run extraction against transcript cache and store quote results.</p>
+        <div class="status-grid" style="grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); max-width: 100%;">
+          <label><strong>Ticker ID</strong><input id="mqExtractTickerId" type="text" value="" /></label>
+          <label><strong>Provider</strong>
+            <select id="mqExtractProvider">
+              <option value="ollama">ollama</option>
+              <option value="openrouter">openrouter</option>
+            </select>
+          </label>
+          <label><strong>Model</strong><input id="mqExtractModel" type="text" placeholder="qwen3.5:30b or anthropic/claude-sonnet-4.5" /></label>
+          <label><strong>Prompt version</strong><input id="mqExtractPromptVersion" type="text" /></label>
+          <label><strong>Limit</strong><input id="mqExtractLimit" type="number" min="1" step="1" /></label>
+          <label><strong>Sleep (seconds)</strong><input id="mqExtractSleep" type="number" min="0" max="300" step="0.1" value="0" /></label>
+          <label class="check-inline"><input id="mqExtractDryRun" type="checkbox" /> Dry run</label>
+          <label class="check-inline"><input id="mqExtractCreateTable" type="checkbox" /> Create table</label>
+          <label class="check-inline"><input id="mqExtractMigrate" type="checkbox" /> Migrate dedupe prompt</label>
+        </div>
+        <div class="cli-toolbar">
+          <button id="mqExtractBtn">Run extract</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Management Quotes Compare</h2>
+        <p class="help">Compare management prompt versions for a ticker.</p>
+        <div class="status-grid" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); max-width: 100%;">
+          <label><strong>Ticker ID</strong><input id="mqCompareTickerId" type="text" value="" /></label>
+          <label><strong>Local prompt</strong><input id="mqCompareLocalPrompt" type="text" value="management_quotes_v1_ollama" /></label>
+          <label><strong>Cloud prompt</strong><input id="mqCompareCloudPrompt" type="text" value="management_quotes_v1" /></label>
+          <label class="check-inline"><input id="mqCompareNoCsv" type="checkbox" /> No CSV</label>
+        </div>
+        <div class="cli-toolbar">
+          <button id="mqCompareBtn">Run compare</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Management Quotes Output</h2>
+        <pre id="managementQuotesCommand">No operation run yet.</pre>
+      </section>
+
+        <section>
+          <h2>Credential Configuration</h2>
+          <p class="help">Financial Modeling Prep API key configuration for management-quote extraction. <a href="https://site.financialmodelingprep.com/developer/docs" target="_blank" rel="noopener noreferrer">Financial Modeling Prep docs</a>.</p>
+          <div class="status-grid" style="grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); max-width: 100%;">
+          <label for="mqFmpConfigPath"><strong>Management Quotes config JSON path:</strong>
+            <input id="mqFmpConfigPath" type="text" placeholder="./data/secrets/management_quotes/app-config.json" />
+          </label>
+          <label for="mqManagementQuotesToken"><strong>Management Quotes API Token:</strong>
+            <input id="mqManagementQuotesToken" type="password" placeholder="Optional token for protected endpoints" autocomplete="off" />
+          </label>
+          <label for="mqFmpConfigUpload"><strong>Upload config JSON:</strong>
+            <input id="mqFmpConfigUpload" type="file" accept="application/json,.json" />
+          </label>
+          <div class="cli-toolbar" style="align-self: end;">
+            <button id="mqFmpConfigSaveBtn">Save path</button>
+            <button id="mqFmpConfigUploadBtn" class="secondary">Upload file</button>
+            <button id="mqFmpConfigClearBtn" class="secondary">Clear config</button>
+          </div>
+        </div>
+        <pre id="mqFmpMessage">No credential action run yet.</pre>
       </section>
     </section>
 
@@ -202,6 +286,35 @@ const factsetSdkMethodFilterEl = document.getElementById('factsetSdkMethodFilter
 const factsetSdkRefreshBtn = document.getElementById('factsetSdkRefreshBtn');
 const factsetSdkSummaryEl = document.getElementById('factsetSdkSummary');
 const factsetSdkOptionsEl = document.getElementById('factsetSdkOptions');
+const managementQuotesTabStatusEl = document.getElementById('managementQuotesTabStatus');
+const managementQuotesCommandEl = document.getElementById('managementQuotesCommand');
+const mqFmpConfigPathEl = document.getElementById('mqFmpConfigPath');
+const mqFmpConfigUploadEl = document.getElementById('mqFmpConfigUpload');
+const mqManagementQuotesTokenEl = document.getElementById('mqManagementQuotesToken');
+const mqFmpMessageEl = document.getElementById('mqFmpMessage');
+const mqFmpConfigSaveBtn = document.getElementById('mqFmpConfigSaveBtn');
+const mqFmpConfigUploadBtn = document.getElementById('mqFmpConfigUploadBtn');
+const mqFmpConfigClearBtn = document.getElementById('mqFmpConfigClearBtn');
+const mqSyncTickerIdEl = document.getElementById('mqSyncTickerId');
+const mqSyncYearsEl = document.getElementById('mqSyncYears');
+const mqSyncSleepSecondsEl = document.getElementById('mqSyncSleepSeconds');
+const mqSyncDryRunEl = document.getElementById('mqSyncDryRun');
+const mqSyncBtn = document.getElementById('mqSyncBtn');
+const mqExtractTickerIdEl = document.getElementById('mqExtractTickerId');
+const mqExtractProviderEl = document.getElementById('mqExtractProvider');
+const mqExtractModelEl = document.getElementById('mqExtractModel');
+const mqExtractPromptVersionEl = document.getElementById('mqExtractPromptVersion');
+const mqExtractLimitEl = document.getElementById('mqExtractLimit');
+const mqExtractSleepEl = document.getElementById('mqExtractSleep');
+const mqExtractDryRunEl = document.getElementById('mqExtractDryRun');
+const mqExtractCreateTableEl = document.getElementById('mqExtractCreateTable');
+const mqExtractMigrateEl = document.getElementById('mqExtractMigrate');
+const mqExtractBtn = document.getElementById('mqExtractBtn');
+const mqCompareTickerIdEl = document.getElementById('mqCompareTickerId');
+const mqCompareLocalPromptEl = document.getElementById('mqCompareLocalPrompt');
+const mqCompareCloudPromptEl = document.getElementById('mqCompareCloudPrompt');
+const mqCompareNoCsvEl = document.getElementById('mqCompareNoCsv');
+const mqCompareBtn = document.getElementById('mqCompareBtn');
 
 let factsetSdkCatalog = null;
 
@@ -280,6 +393,7 @@ function getInitialTabFromUrl() {
   const normalized = tab.toLowerCase();
   if (normalized === 'services') return 'servicesTab';
   if (normalized === 'localwiki') return 'localwikiTab';
+  if (normalized === 'management-quotes') return 'managementQuotesTab';
   if (normalized === 'factset-oauth') return 'factsetTab';
   if (normalized === 'factset-sdk') return 'factsetSdkTab';
   return 'servicesTab';
@@ -817,6 +931,46 @@ async function uploadFactsetConfig() {
   await refreshFactsetStatus();
 }
 
+async function saveMqFmpConfigPath() {
+  const config_path = (mqFmpConfigPathEl.value || '').trim();
+  const res = await fetch('/api/management-quotes/config', {
+    method: 'POST',
+    headers: managementQuotesRequestHeaders({ includeJsonContentType: true }),
+    body: JSON.stringify({ config_path })
+  });
+  const data = await res.json();
+  mqFmpMessageEl.textContent = data.message || (data.ok ? 'Saved' : 'Save failed');
+}
+
+async function uploadMqFmpConfig() {
+  if (!mqFmpConfigUploadEl.files || mqFmpConfigUploadEl.files.length === 0) {
+    mqFmpMessageEl.textContent = 'Choose a JSON file first.';
+    return;
+  }
+  const file = mqFmpConfigUploadEl.files[0];
+  const content = await file.text();
+  const res = await fetch('/api/management-quotes/upload', {
+    method: 'POST',
+    headers: managementQuotesRequestHeaders({ includeJsonContentType: true }),
+    body: JSON.stringify({ filename: file.name, content })
+  });
+  const data = await res.json();
+  mqFmpMessageEl.textContent = data.message || (data.ok ? 'Uploaded' : 'Upload failed');
+}
+
+async function clearMqFmpConfig() {
+  const headers = managementQuotesRequestHeaders();
+  const fetchConfig = {
+    method: 'POST',
+  };
+  if (Object.keys(headers).length) {
+    fetchConfig.headers = headers;
+  }
+  const res = await fetch('/api/management-quotes/clear', fetchConfig);
+  const data = await res.json();
+  mqFmpMessageEl.textContent = data.message || (data.ok ? 'Cleared' : 'Clear failed');
+}
+
 async function testFactsetOauth() {
   const res = await fetch('/api/integrations/factset/test', { method: 'POST' });
   const data = await res.json();
@@ -874,6 +1028,194 @@ async function runSourcesUpdate() {
   const data = await res.json();
   localwikiCommandEl.textContent = formatCommandResult(data);
   await refreshLocalwiki();
+}
+
+function parseManagementQuotesNumber(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const parsed = Number(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function managementQuotesAuthHeaders() {
+  const token = String((mqManagementQuotesTokenEl && mqManagementQuotesTokenEl.value) || '').trim();
+  if (token) {
+    try {
+      sessionStorage.setItem('management_quotes_api_token', token);
+    } catch (_err) {
+    }
+    return {
+      'X-Management-Quotes-Token': token,
+    };
+  }
+
+  try {
+    const cachedToken = sessionStorage.getItem('management_quotes_api_token');
+    if (cachedToken) {
+      mqManagementQuotesTokenEl.value = cachedToken;
+      return {
+        'X-Management-Quotes-Token': String(cachedToken),
+      };
+    }
+  } catch (_err) {
+  }
+
+  return {};
+}
+
+function managementQuotesRequestHeaders({ includeJsonContentType = false } = {}) {
+  const headers = Object.assign({}, includeJsonContentType ? { 'Content-Type': 'application/json' } : {});
+  return Object.assign(headers, managementQuotesAuthHeaders());
+}
+
+function parseManagementQuotesTickerId(value) {
+  const text = String(value || '').trim();
+  return text || null;
+}
+
+function formatManagementQuotesJobResult(data) {
+  const command = data.command || 'management_quotes';
+  const status = data.status || 'unknown';
+  const jobId = data.job_id || 'n/a';
+  const createdAt = data.created_at || 'n/a';
+  const startedAt = data.started_at || 'n/a';
+  const finishedAt = data.finished_at || 'n/a';
+
+  const chunks = [
+    `Job: ${jobId}`,
+    `Command: ${command}`,
+    `Status: ${status}`,
+    `Created at: ${createdAt}`,
+  ];
+
+  if (data.started_at) {
+    chunks.push(`Started at: ${startedAt}`);
+  }
+
+  if (data.finished_at) {
+    chunks.push(`Finished at: ${finishedAt}`);
+  }
+
+  if (data.status === 'completed' && data.result && data.result.ok) {
+    const result = data.result;
+    const outputLines = [
+      `Command: ${result.command || command}`,
+      `Status: OK (${result.exit_code == null ? 'n/a' : result.exit_code})`,
+      `Ran at: ${result.ran_at || 'n/a'}`,
+    ];
+
+    const stdout = cleanCliText(result.stdout || '');
+    const stderr = cleanCliText(result.stderr || '');
+
+    if (stdout) {
+      outputLines.push('', 'STDOUT', '------', stdout);
+    }
+    if (stderr) {
+      outputLines.push('', 'STDERR', '------', stderr);
+    }
+    if (!stdout && !stderr) {
+      outputLines.push('', 'No command output returned.');
+    }
+
+    return [...chunks, '', ...outputLines].join('\n');
+  }
+
+  return chunks.join('\n');
+}
+
+async function pollManagementQuotesJob(jobId, outputEl, maxAttempts = 120, pollDelayMs = 500) {
+  const out = outputEl || managementQuotesCommandEl;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const statusResponse = await fetch(`/api/management-quotes/jobs/${encodeURIComponent(jobId)}`, {
+      headers: managementQuotesRequestHeaders(),
+    });
+    const statusData = await statusResponse.json();
+    out.textContent = formatManagementQuotesJobResult(statusData);
+
+    const isCompleted = ['completed', 'failed'].includes(statusData.status);
+    const isSuccessful = statusData.status === 'completed' && !statusData.error;
+
+    if (isCompleted) {
+      setTabStatus(managementQuotesTabStatusEl, Boolean(isSuccessful));
+      return;
+    }
+
+    if (!statusResponse.ok) {
+      out.textContent = `Management quotes job status request failed: ${statusData.error || 'Unknown'}`;
+      setTabStatus(managementQuotesTabStatusEl, false);
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, pollDelayMs));
+  }
+
+  out.textContent = `${out.textContent}\n\nPolling timed out waiting for job completion.`;
+  setTabStatus(managementQuotesTabStatusEl, false);
+}
+
+async function runManagementQuotesCommand(route, payload, outputEl) {
+  const out = outputEl || managementQuotesCommandEl;
+  out.textContent = `Running management quotes command: ${route}...`;
+
+  try {
+    const res = await fetch(`/api/management-quotes/${route}`, {
+      method: 'POST',
+      headers: managementQuotesRequestHeaders({ includeJsonContentType: true }),
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data && data.job_id && data.status) {
+      out.textContent = formatManagementQuotesJobResult(data);
+      await pollManagementQuotesJob(data.job_id, out);
+      return;
+    }
+
+    out.textContent = formatCommandResult(data);
+    setTabStatus(managementQuotesTabStatusEl, Boolean(data.ok));
+  } catch (err) {
+    out.textContent = `Management quotes ${route} failed: ${err}`;
+    setTabStatus(managementQuotesTabStatusEl, false);
+  }
+}
+
+async function runManagementQuotesSync() {
+  const payload = {
+    ticker_id: parseManagementQuotesTickerId(mqSyncTickerIdEl.value),
+    years: parseManagementQuotesNumber(mqSyncYearsEl.value),
+    sleep_seconds: parseManagementQuotesNumber(mqSyncSleepSecondsEl.value),
+    dry_run: Boolean(mqSyncDryRunEl.checked),
+  };
+  await runManagementQuotesCommand('sync', payload, managementQuotesCommandEl);
+}
+
+async function runManagementQuotesExtract() {
+  const payload = {
+    ticker_id: parseManagementQuotesTickerId(mqExtractTickerIdEl.value),
+    provider: (mqExtractProviderEl.value || 'ollama').trim(),
+    model: (mqExtractModelEl.value || '').trim(),
+    prompt_version: (mqExtractPromptVersionEl.value || '').trim(),
+    sleep: parseManagementQuotesNumber(mqExtractSleepEl.value),
+    dry_run: Boolean(mqExtractDryRunEl.checked),
+    create_table: Boolean(mqExtractCreateTableEl.checked),
+    migrate_dedupe_include_prompt_version: Boolean(mqExtractMigrateEl.checked),
+  };
+
+  const limit = parseManagementQuotesNumber(mqExtractLimitEl.value);
+  if (limit !== null) {
+    payload.limit = limit;
+  }
+
+  await runManagementQuotesCommand('extract', payload, managementQuotesCommandEl);
+}
+
+async function runManagementQuotesCompare() {
+  const payload = {
+    ticker_id: parseManagementQuotesTickerId(mqCompareTickerIdEl.value),
+    local_prompt_version: (mqCompareLocalPromptEl.value || 'management_quotes_v1_ollama').trim(),
+    cloud_prompt_version: (mqCompareCloudPromptEl.value || 'management_quotes_v1').trim(),
+    no_csv: Boolean(mqCompareNoCsvEl.checked),
+  };
+  await runManagementQuotesCommand('compare', payload, managementQuotesCommandEl);
 }
 
 async function restartService(serviceName) {
@@ -1006,6 +1348,13 @@ factsetSdkOptionsEl.addEventListener('click', async (event) => {
     }
   }
 });
+mqSyncBtn.addEventListener('click', runManagementQuotesSync);
+mqExtractBtn.addEventListener('click', runManagementQuotesExtract);
+mqCompareBtn.addEventListener('click', runManagementQuotesCompare);
+mqFmpConfigSaveBtn.addEventListener('click', saveMqFmpConfigPath);
+mqFmpConfigUploadBtn.addEventListener('click', uploadMqFmpConfig);
+mqFmpConfigClearBtn.addEventListener('click', clearMqFmpConfig);
+
 document.querySelectorAll('[data-cmd]').forEach((btn) => {
   btn.addEventListener('click', () => runLocalwikiCommand(btn.dataset.cmd));
 });
@@ -1013,6 +1362,7 @@ tabButtons.forEach((btn) => {
   btn.addEventListener('click', () => activateTab(btn.dataset.tabTarget));
 });
 activateTab(getInitialTabFromUrl());
+setTabStatus(managementQuotesTabStatusEl, true);
 refresh();
 setInterval(refresh, 60_000);
 </script>

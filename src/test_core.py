@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 import importlib.util
 import types
+import time
 
 # Add project root and src to Python path for direct execution
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -401,7 +402,11 @@ def _load_imager_app_module_for_tests():
         fake_flask.Flask = _FakeFlask
         fake_flask.jsonify = _fake_jsonify
         fake_flask.render_template = _fake_render_template
-        fake_flask.request = types.SimpleNamespace()
+        fake_request = types.SimpleNamespace(
+            get_json=lambda **_: {},
+            headers={},
+        )
+        fake_flask.request = fake_request
         sys.modules["flask"] = fake_flask
 
     spec = importlib.util.spec_from_file_location("warlock_ui_app", PROJECT_ROOT / "ui" / "app.py")
@@ -483,6 +488,10 @@ def _read_imager_template():
     return (PROJECT_ROOT / "ui" / "templates" / "imager.html").read_text(encoding="utf-8")
 
 
+def _read_dashboard_template():
+    return (PROJECT_ROOT / "ui" / "templates" / "index.html").read_text(encoding="utf-8")
+
+
 def test_imager_template_contains_reels_controls():
     template = _read_imager_template()
     assert 'id="reelUsername"' in template
@@ -493,6 +502,19 @@ def test_imager_template_contains_reels_controls():
     assert 'id="reelUseCache"' in template
     assert 'id="discoverReelsBtn"' in template
     assert 'id="reelDiscoverOutput"' in template
+
+
+def test_dashboard_template_contains_management_quotes_ui():
+    template = _read_dashboard_template()
+    assert 'id="managementQuotesTabStatus"' in template
+    assert 'id="mqSyncTickerId"' in template
+    assert 'id="mqExtractTickerId"' in template
+    assert 'id="mqCompareTickerId"' in template
+    assert 'id="managementQuotesCommand"' in template
+    assert 'id="mqFmpConfigPath"' in template
+    assert 'id="mqFmpConfigUpload"' in template
+    assert 'id="mqFmpMessage"' in template
+    assert 'id="mqFmpConfigClearBtn"' in template
 
 
 def test_imager_status_payload_exposes_reels_discovery_settings():
@@ -523,7 +545,7 @@ def test_imager_route_includes_reels_controls_in_rendered_html():
     assert '/api/imager/reels/discover' in html
 
 
-def test_ui_navigation_includes_imager_entry_on_landing_and_dashboard():
+def test_ui_navigation_includes_imager_entry_on_landing_only():
     app_module = _load_imager_app_module_for_tests()
     app = getattr(app_module, "app", None)
     test_client = getattr(app, "test_client", None)
@@ -536,8 +558,8 @@ def test_ui_navigation_includes_imager_entry_on_landing_and_dashboard():
 
     assert 'href="/imager"' in landing_html
     assert 'Open Imager Webscraper' in landing_html
-    assert 'href="/imager"' in dashboard_html
-    assert 'Open Imager Webscraper' in dashboard_html
+    assert 'href="/imager"' not in dashboard_html
+    assert 'Open Imager Webscraper' not in dashboard_html
 
 
 def _extract_json_response(response):
@@ -571,6 +593,924 @@ def _run_imager_reels_discover_with_body(app_module, body):
         return app_module.api_imager_reels_discover()
     finally:
         app_module.request = original_request
+
+
+def _run_management_quotes_route_with_body(app_module, route_name, body, headers=None, disable_token_gate: bool = True):
+    if headers is None:
+        headers = {}
+
+    restored_token = None
+    if disable_token_gate and not headers:
+        restored_token = getattr(app_module, "MANAGEMENT_QUOTES_API_TOKEN", "")
+        app_module.MANAGEMENT_QUOTES_API_TOKEN = ""
+
+    app = getattr(app_module, "app", None)
+    test_request_context = getattr(app, "test_request_context", None)
+    if callable(test_request_context):
+        try:
+            with test_request_context(
+                f"/api/management-quotes/{route_name}",
+                method="POST",
+                json=body,
+                headers=headers,
+            ):
+                return getattr(app_module, f"api_management_quotes_{route_name}")()
+        finally:
+            if restored_token is not None:
+                app_module.MANAGEMENT_QUOTES_API_TOKEN = restored_token
+
+    original_request = app_module.request
+    app_module.request = types.SimpleNamespace(
+        get_json=lambda **_: body,
+        headers=(dict(getattr(original_request, "headers", {})) if headers is None else dict(headers)),
+    )
+    try:
+        return getattr(app_module, f"api_management_quotes_{route_name}")()
+    finally:
+        app_module.request = original_request
+        if restored_token is not None:
+            app_module.MANAGEMENT_QUOTES_API_TOKEN = restored_token
+
+
+def _run_management_quotes_job_status_route(app_module, job_id, disable_token_gate: bool = True):
+    restored_token = None
+    if disable_token_gate:
+        restored_token = getattr(app_module, "MANAGEMENT_QUOTES_API_TOKEN", "")
+        app_module.MANAGEMENT_QUOTES_API_TOKEN = ""
+
+    app = getattr(app_module, "app", None)
+    test_request_context = getattr(app, "test_request_context", None)
+    if callable(test_request_context):
+        try:
+            with test_request_context(f"/api/management-quotes/jobs/{job_id}", method="GET"):
+                return app_module.api_management_quotes_job_status(job_id)
+        finally:
+            if restored_token is not None:
+                app_module.MANAGEMENT_QUOTES_API_TOKEN = restored_token
+
+    original_request = app_module.request
+    app_module.request = types.SimpleNamespace(get_json=lambda **_: None)
+    try:
+        return app_module.api_management_quotes_job_status(job_id)
+    finally:
+        app_module.request = original_request
+        if restored_token is not None:
+            app_module.MANAGEMENT_QUOTES_API_TOKEN = restored_token
+
+
+def _wait_for_management_quotes_call(calls, timeout_seconds: float = 1.0):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if calls.get("args") is not None:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _clear_management_quotes_jobs_for_tests(app_module):
+    jobs = getattr(app_module, "MANAGEMENT_QUOTES_JOBS", None)
+    if isinstance(jobs, dict):
+        jobs.clear()
+
+
+def test_api_management_quotes_sync_validates_ticker_id():
+    app_module = _load_imager_app_module_for_tests()
+
+    response, status_code = _extract_json_response(_run_management_quotes_route_with_body(app_module, "sync", {}))
+    assert status_code == 400
+    assert response.get("ok") is False
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_TICKER_ID_REQUIRED"
+
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(app_module, "sync", {"ticker_id": "   ", "years": 3})
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_TICKER_ID_REQUIRED"
+
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(app_module, "sync", {"ticker_id": 12, "years": 999})
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_YEARS_INVALID"
+
+
+def test_api_management_quotes_sync_accepts_equity_ticker_with_space():
+    app_module = _load_imager_app_module_for_tests()
+
+    calls = {}
+
+    def fake_run(args):
+        calls["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "ok",
+            "stderr": "",
+            "latency_ms": 1,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    original_runner = app_module._run_management_quotes_command
+    app_module._run_management_quotes_command = fake_run
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "sync",
+                {"ticker_id": "2124 JP Equity", "years": 3},
+            )
+        )
+    finally:
+        app_module._run_management_quotes_command = original_runner
+
+    assert status_code == 202
+    assert response.get("ok") is True
+    assert calls["args"][2] == "2124 JP Equity"
+
+
+def test_api_management_quotes_extract_validates_provider_and_fields():
+    app_module = _load_imager_app_module_for_tests()
+
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(app_module, "extract", {"ticker_id": 12, "provider": "openai"})
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_PROVIDER_INVALID"
+
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(app_module, "extract", {"ticker_id": 12, "sleep": -1})
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_SLEEP_INVALID"
+
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(app_module, "extract", {"ticker_id": 12, "limit": 0})
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_LIMIT_INVALID"
+
+
+def test_api_management_quotes_extract_uses_defaults_and_caps():
+    app_module = _load_imager_app_module_for_tests()
+
+    calls = {}
+
+    def fake_run(args):
+        calls["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "ok",
+            "stderr": "",
+            "latency_ms": 1,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    original_runner = app_module._run_management_quotes_command
+    app_module._run_management_quotes_command = fake_run
+    _clear_management_quotes_jobs_for_tests(app_module)
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "extract",
+                {
+                    "ticker_id": 12,
+                    "provider": "ollama",
+                },
+            )
+        )
+    finally:
+        app_module._run_management_quotes_command = original_runner
+
+    assert status_code == 202
+    assert response.get("ok") is True
+    assert response.get("command") == "extract"
+    assert calls["args"] == [
+        "extract",
+        "--ticker-id",
+        "12",
+        "--provider",
+        "ollama",
+        "--sleep",
+        "0.0",
+        "--limit",
+        "50",
+    ]
+
+    # Ensure explicit out-of-range limits are rejected.
+    _clear_management_quotes_jobs_for_tests(app_module)
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(
+            app_module,
+            "extract",
+            {
+                "ticker_id": 12,
+                "provider": "ollama",
+                "limit": app_module.MANAGEMENT_QUOTES_EXTRACT_MAX_LIMIT + 1,
+            },
+        )
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_LIMIT_INVALID"
+
+
+def test_api_management_quotes_extract_blocks_schema_mutation_when_disabled():
+    app_module = _load_imager_app_module_for_tests()
+    original_flag = app_module.MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES
+    app_module.MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES = False
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "extract",
+                {
+                    "ticker_id": 12,
+                    "provider": "ollama",
+                    "create_table": True,
+                },
+            )
+        )
+    finally:
+        app_module.MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES = original_flag
+    assert status_code == 403
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_SCHEMA_CHANGES_DISABLED"
+
+
+def test_api_management_quotes_endpoints_require_token_when_configured():
+    app_module = _load_imager_app_module_for_tests()
+    original_token = app_module.MANAGEMENT_QUOTES_API_TOKEN
+    original_runner = app_module._run_management_quotes_command
+
+    def fake_run(_args):
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "ok",
+            "stderr": "",
+            "latency_ms": 1,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    app_module.MANAGEMENT_QUOTES_API_TOKEN = "secret-token"
+    app_module._run_management_quotes_command = fake_run
+    try:
+        app_module.request.headers = {"X-Management-Quotes-Token": "wrong"}
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "sync",
+                {"ticker_id": 12},
+                headers={"X-Management-Quotes-Token": "wrong"},
+            )
+        )
+        assert status_code == 401
+        assert response.get("error_code") == "MANAGEMENT_QUOTES_UNAUTHORIZED"
+
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "sync",
+                {"ticker_id": 12},
+                headers={"X-Management-Quotes-Token": "secret-token"},
+            )
+        )
+        assert status_code == 202
+        assert response.get("ok") is True
+
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "sync",
+                {"ticker_id": 12},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+        )
+        assert status_code == 202
+        assert response.get("ok") is True
+    finally:
+        app_module.MANAGEMENT_QUOTES_API_TOKEN = original_token
+        app_module._run_management_quotes_command = original_runner
+
+
+def test_api_management_quotes_config_endpoints_require_token_when_configured():
+    app_module = _load_imager_app_module_for_tests()
+    original_token = app_module.MANAGEMENT_QUOTES_API_TOKEN
+    original_state_path = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+    original_upload_dir = app_module.MANAGEMENT_QUOTES_UPLOAD_DIR
+    original_upload_path = app_module.MANAGEMENT_QUOTES_UPLOAD_PATH
+
+    app_module.MANAGEMENT_QUOTES_API_TOKEN = "secret-token"
+
+    with tempfile.TemporaryDirectory(prefix="mq-fmp-auth-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        source_path = tmp_root / "app-config.json"
+        source_path.write_text('{"FMP_API_KEY":"from-file"}', encoding="utf-8")
+
+        app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = tmp_root / "state.json"
+        app_module.MANAGEMENT_QUOTES_UPLOAD_DIR = tmp_root / "secrets"
+        app_module.MANAGEMENT_QUOTES_UPLOAD_PATH = app_module.MANAGEMENT_QUOTES_UPLOAD_DIR / "app-config.json"
+
+        try:
+            wrong = {"X-Management-Quotes-Token": "wrong"}
+            correct = {"X-Management-Quotes-Token": "secret-token"}
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "config",
+                    {"config_path": str(source_path)},
+                    headers=wrong,
+                )
+            )
+            assert status_code == 401
+            assert response.get("error_code") == "MANAGEMENT_QUOTES_UNAUTHORIZED"
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "config",
+                    {"config_path": str(source_path)},
+                    headers=correct,
+                )
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "upload",
+                    {"filename": "app-config.json", "content": '{"api_key":"token-route"}'},
+                    headers=wrong,
+                )
+            )
+            assert status_code == 401
+            assert response.get("error_code") == "MANAGEMENT_QUOTES_UNAUTHORIZED"
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "clear",
+                    {},
+                    headers=wrong,
+                )
+            )
+            assert status_code == 401
+            assert response.get("error_code") == "MANAGEMENT_QUOTES_UNAUTHORIZED"
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "upload",
+                    {"filename": "app-config.json", "content": '{"api_key":"token-route"}'},
+                    headers=correct,
+                )
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "clear",
+                    {},
+                    headers=correct,
+                )
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+            assert response.get("configured") is False
+        finally:
+            app_module.MANAGEMENT_QUOTES_API_TOKEN = original_token
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state_path
+            app_module.MANAGEMENT_QUOTES_UPLOAD_DIR = original_upload_dir
+            app_module.MANAGEMENT_QUOTES_UPLOAD_PATH = original_upload_path
+
+
+def test_api_management_quotes_credential_routes_manage_fmp_config():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="mq-fmp-creds-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        original_state_path = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+        original_upload_dir = app_module.MANAGEMENT_QUOTES_UPLOAD_DIR
+        original_upload_path = app_module.MANAGEMENT_QUOTES_UPLOAD_PATH
+
+        app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = tmp_root / "management_quotes.json"
+        app_module.MANAGEMENT_QUOTES_UPLOAD_DIR = tmp_root / "secrets"
+        app_module.MANAGEMENT_QUOTES_UPLOAD_PATH = app_module.MANAGEMENT_QUOTES_UPLOAD_DIR / "app-config.json"
+
+        source_path = tmp_root / "app-config.json"
+        source_path.write_text('{"FMP_API_KEY":"test-key-from-path"}', encoding="utf-8")
+
+        source_path_txt = tmp_root / "fmp_config.txt"
+        source_path_txt.write_text(
+            "# Database\n"
+            "NEON_CONNECTION_STRING=postgresql://user:password@host/database\n"
+            "# Financial Modeling Prep\n"
+            "FMP_API_KEY=txt-file-key\n",
+            encoding="utf-8",
+        )
+
+        try:
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "config",
+                    {"config_path": str(source_path)},
+                )
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+            state = app_module._load_management_quotes_credentials_state()
+            assert state.get("config_source") == "path"
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "config",
+                    {
+                        "config_path": str(source_path_txt),
+                    },
+                )
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+            state = app_module._load_management_quotes_credentials_state()
+            assert state.get("config_source") == "path"
+            assert state.get("config_path") == str(source_path_txt)
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "upload",
+                    {"filename": "app-config.json", "content": '{"api_key":"uploaded-key"}'},
+                )
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+            assert app_module.MANAGEMENT_QUOTES_UPLOAD_PATH.exists()
+            state = app_module._load_management_quotes_credentials_state()
+            assert state.get("config_source") == "uploaded_file"
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(app_module, "clear", {})
+            )
+            assert status_code == 200
+            assert response.get("ok") is True
+            state = app_module._load_management_quotes_credentials_state()
+            assert state.get("config_source") == "not_set"
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "upload",
+                    {"filename": "bad.txt", "content": '{"api_key":"x"}'},
+                )
+            )
+            assert status_code == 400
+            assert response.get("message") == "Uploaded filename must end with .json."
+
+            response, status_code = _extract_json_response(
+                _run_management_quotes_route_with_body(
+                    app_module,
+                    "upload",
+                    {"filename": "app-config.json", "content": "not-json"},
+                )
+            )
+            assert status_code == 400
+            assert response.get("message") == "Invalid Management Quotes configuration."
+        finally:
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state_path
+            app_module.MANAGEMENT_QUOTES_UPLOAD_DIR = original_upload_dir
+            app_module.MANAGEMENT_QUOTES_UPLOAD_PATH = original_upload_path
+
+
+def test_api_management_quotes_api_key_resolution_prefers_environment_then_state_path():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="mq-fmp-key-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        original_state_path = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+        state_path = tmp_root / "state.json"
+        config_path = tmp_root / "app-config.json"
+
+        app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = state_path
+        config_path.write_text('{"FMP_API_TOKEN":"state-key"}', encoding="utf-8")
+        state = app_module._load_management_quotes_credentials_state()
+        state["config_source"] = "path"
+        state["config_path"] = str(config_path)
+        app_module._save_management_quotes_credentials_state(state)
+
+        original_fmp_api_key = os.environ.get("FMP_API_KEY")
+        original_fmp_api_token = os.environ.get("FMP_API_TOKEN")
+
+        try:
+            os.environ["FMP_API_KEY"] = "env-key"
+            assert app_module._resolve_management_quotes_api_key() == "env-key"
+
+            if "FMP_API_KEY" in os.environ:
+                del os.environ["FMP_API_KEY"]
+
+            if "FMP_API_TOKEN" in os.environ:
+                del os.environ["FMP_API_TOKEN"]
+
+            assert app_module._resolve_management_quotes_api_key() == "state-key"
+        finally:
+            if original_fmp_api_key is None:
+                os.environ.pop("FMP_API_KEY", None)
+            else:
+                os.environ["FMP_API_KEY"] = original_fmp_api_key
+
+            if original_fmp_api_token is None:
+                os.environ.pop("FMP_API_TOKEN", None)
+            else:
+                os.environ["FMP_API_TOKEN"] = original_fmp_api_token
+
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state_path
+
+
+def test_api_management_quotes_api_key_resolution_reads_fmp_config_txt_path():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="mq-fmp-text-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        config_file = tmp_root / "fmp_config.txt"
+        config_file.write_text(
+            "# Database\n"
+            "NEON_CONNECTION_STRING=postgresql://user:password@host/database\n"
+            "\n"
+            "# Financial Modeling Prep\n"
+            "FMP_API_KEY=my-text-fmp-key\n"
+            "\n"
+            "# Optional\n"
+            "OPENROUTER_API_KEY=or-key\n",
+            encoding="utf-8",
+        )
+
+        original_fallback = app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH
+        original_state_path = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+        app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = config_file
+        app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = tmp_root / "state.json"
+
+        try:
+            assert app_module._resolve_management_quotes_api_key() == "my-text-fmp-key"
+        finally:
+            app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = original_fallback
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state_path
+
+
+def test_api_management_quotes_database_dsn_resolution_prefers_environment_then_state_path():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="mq-dsn-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        original_state_path = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+        state_path = tmp_root / "state.json"
+        config_path = tmp_root / "app-config.json"
+
+        app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = state_path
+        config_path.write_text('{"NEON_CONNECTION_STRING":"postgresql://state-user:state-pass@state-host/state-db"}', encoding="utf-8")
+        state = app_module._load_management_quotes_credentials_state()
+        state["config_source"] = "path"
+        state["config_path"] = str(config_path)
+        app_module._save_management_quotes_credentials_state(state)
+
+        original_neon = os.environ.get("NEON_CONNECTION_STRING")
+        original_database_url = os.environ.get("DATABASE_URL")
+
+        try:
+            os.environ["NEON_CONNECTION_STRING"] = "postgresql://env-user:env-pass@env-host/env-db"
+            assert app_module._resolve_management_quotes_database_dsn() == "postgresql://env-user:env-pass@env-host/env-db"
+
+            os.environ.pop("NEON_CONNECTION_STRING")
+            os.environ.pop("DATABASE_URL", None)
+            assert app_module._resolve_management_quotes_database_dsn() == "postgresql://state-user:state-pass@state-host/state-db"
+        finally:
+            if original_neon is None:
+                os.environ.pop("NEON_CONNECTION_STRING", None)
+            else:
+                os.environ["NEON_CONNECTION_STRING"] = original_neon
+
+            if original_database_url is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = original_database_url
+
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state_path
+
+
+def test_api_management_quotes_database_dsn_resolution_reads_fallback_config_txt_path():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="mq-dsn-text-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        config_file = tmp_root / "fmp_config.txt"
+        config_file.write_text(
+            "# Database\n"
+            "NEON_CONNECTION_STRING=postgresql://fallback-user:fallback-pass@fallback-host/fallback-db\n"
+            "FMP_API_KEY=txt-key\n",
+            encoding="utf-8",
+        )
+
+        original_fallback = app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH
+        original_state_path = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+
+        try:
+            app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = config_file
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = tmp_root / "state.json"
+
+            assert app_module._resolve_management_quotes_database_dsn() == (
+                "postgresql://fallback-user:fallback-pass@fallback-host/fallback-db"
+            )
+        finally:
+            app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = original_fallback
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state_path
+
+
+def test_run_management_quotes_command_includes_management_dsn_and_api_key_env():
+    app_module = _load_imager_app_module_for_tests()
+
+    calls = {}
+
+    class _FakeResult:
+        returncode = 0
+
+    original_run = app_module.subprocess.run
+
+    def fake_run(command, **kwargs):
+        calls["command"] = list(command)
+        calls["env"] = dict(kwargs.get("env", {}))
+        return _FakeResult()
+
+    original_neon = os.environ.get("NEON_CONNECTION_STRING")
+    original_fmp_key = os.environ.get("FMP_API_KEY")
+
+    try:
+        os.environ["NEON_CONNECTION_STRING"] = "postgresql://env-user:env-pass@env-host/env-db"
+        os.environ["FMP_API_KEY"] = "env-fmp-key"
+        app_module.subprocess.run = fake_run
+
+        result = app_module._run_management_quotes_command(["sync", "--ticker-id", "1234"])
+
+        assert result.get("ok") is True
+        assert calls["env"].get("NEON_CONNECTION_STRING") == "postgresql://env-user:env-pass@env-host/env-db"
+        assert calls["env"].get("FMP_API_KEY") == "env-fmp-key"
+        assert calls["command"][0] == str(app_module.LOCALWIKI_VENV_PYTHON)
+    finally:
+        app_module.subprocess.run = original_run
+        if original_neon is None:
+            os.environ.pop("NEON_CONNECTION_STRING", None)
+        else:
+            os.environ["NEON_CONNECTION_STRING"] = original_neon
+
+        if original_fmp_key is None:
+            os.environ.pop("FMP_API_KEY", None)
+        else:
+            os.environ["FMP_API_KEY"] = original_fmp_key
+
+
+def test_api_management_quotes_compare_rejects_missing_prompt_version():
+    app_module = _load_imager_app_module_for_tests()
+
+    response, status_code = _extract_json_response(
+        _run_management_quotes_route_with_body(app_module, "compare", {"ticker_id": 12, "local_prompt_version": "", "cloud_prompt_version": ""})
+    )
+    assert status_code == 400
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_PROMPT_VERSION_REQUIRED"
+
+
+def test_api_management_quotes_extract_uses_subprocess_helper(monkeypatch):
+    app_module = _load_imager_app_module_for_tests()
+    _clear_management_quotes_jobs_for_tests(app_module)
+
+    calls = {}
+
+    def fake_run(args):
+        calls["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "done",
+            "stderr": "",
+            "latency_ms": 1,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    original_runner = app_module._run_management_quotes_command
+    app_module._run_management_quotes_command = fake_run
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "extract",
+                {
+                    "ticker_id": 12,
+                    "provider": "ollama",
+                    "model": "qwen3.5:30b",
+                    "sleep": 0.1,
+                    "limit": 2,
+                },
+            )
+    )
+    finally:
+        app_module._run_management_quotes_command = original_runner
+
+    assert status_code == 202
+    assert response.get("ok") is True
+    assert response.get("command") == "extract"
+    assert isinstance(response.get("job_id"), str)
+    assert response.get("status") == "queued"
+    assert _wait_for_management_quotes_call(calls)
+    assert calls.get("args") == [
+        "extract",
+        "--ticker-id",
+        "12",
+        "--provider",
+        "ollama",
+        "--model",
+        "qwen3.5:30b",
+        "--sleep",
+        "0.1",
+        "--limit",
+        "2",
+    ]
+
+
+def test_api_management_quotes_sync_uses_subprocess_helper(monkeypatch):
+    app_module = _load_imager_app_module_for_tests()
+    _clear_management_quotes_jobs_for_tests(app_module)
+
+    calls = {}
+
+    def fake_run(args):
+        calls["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "done",
+            "stderr": "",
+            "latency_ms": 2,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    original_runner = app_module._run_management_quotes_command
+    app_module._run_management_quotes_command = fake_run
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "sync",
+                {
+                    "ticker_id": 12,
+                    "years": 4,
+                    "sleep_seconds": 1.25,
+                    "dry_run": True,
+                },
+            )
+        )
+    finally:
+        app_module._run_management_quotes_command = original_runner
+
+    assert status_code == 202
+    assert response.get("ok") is True
+    assert response.get("command") == "sync"
+    assert isinstance(response.get("job_id"), str)
+    assert response.get("status") == "queued"
+    assert _wait_for_management_quotes_call(calls)
+    assert calls.get("args") == [
+        "sync",
+        "--ticker-id",
+        "12",
+        "--years",
+        "4",
+        "--sleep",
+        "1.25",
+        "--dry-run",
+    ]
+
+
+def test_api_management_quotes_compare_uses_subprocess_helper_and_defaults(monkeypatch):
+    app_module = _load_imager_app_module_for_tests()
+    _clear_management_quotes_jobs_for_tests(app_module)
+
+    calls = {}
+
+    def fake_run(args):
+        calls["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "done",
+            "stderr": "",
+            "latency_ms": 2,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    original_runner = app_module._run_management_quotes_command
+    app_module._run_management_quotes_command = fake_run
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "compare",
+                {
+                    "ticker_id": 12,
+                    "no_csv": True,
+                },
+            )
+        )
+    finally:
+        app_module._run_management_quotes_command = original_runner
+
+    assert status_code == 202
+    assert response.get("ok") is True
+    assert response.get("command") == "compare"
+    assert isinstance(response.get("job_id"), str)
+    assert response.get("status") == "queued"
+    assert _wait_for_management_quotes_call(calls)
+    assert calls.get("args") == [
+        "compare",
+        "--ticker-id",
+        "12",
+        "--local-prompt-version",
+        "management_quotes_v1_ollama",
+        "--cloud-prompt-version",
+        "management_quotes_v1",
+        "--no-csv",
+    ]
+
+
+def test_api_management_quotes_job_status_reports_result(monkeypatch):
+    app_module = _load_imager_app_module_for_tests()
+    _clear_management_quotes_jobs_for_tests(app_module)
+
+    def fake_run(args):
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout": "done",
+            "stderr": "",
+            "latency_ms": 1,
+            "ran_at": "2020-01-01T00:00:00Z",
+        }
+
+    original_runner = app_module._run_management_quotes_command
+    app_module._run_management_quotes_command = fake_run
+
+    try:
+        response, status_code = _extract_json_response(
+            _run_management_quotes_route_with_body(
+                app_module,
+                "extract",
+                {
+                    "ticker_id": 12,
+                    "provider": "ollama",
+                    "model": "qwen3.5:30b",
+                    "sleep": 0.1,
+                    "limit": 2,
+                },
+            )
+        )
+        assert status_code == 202
+        job_id = response.get("job_id")
+        assert isinstance(job_id, str)
+
+        deadline = time.time() + 1.0
+        job_status = None
+        while time.time() < deadline:
+            job_status, job_http_status = _extract_json_response(_run_management_quotes_job_status_route(app_module, job_id))
+            if job_status.get("status") == "completed":
+                break
+            time.sleep(0.01)
+
+        assert job_http_status == 200
+        assert job_status.get("job_id") == job_id
+        assert job_status.get("command") == "extract"
+        assert job_status.get("status") == "completed"
+        assert job_status.get("ok") is True
+        result_payload = job_status.get("result")
+        assert isinstance(result_payload, dict)
+        assert result_payload.get("ok") is True
+        assert result_payload.get("stdout") == "done"
+    finally:
+        app_module._run_management_quotes_command = original_runner
+
+
+def test_api_management_quotes_job_status_not_found():
+    app_module = _load_imager_app_module_for_tests()
+    _clear_management_quotes_jobs_for_tests(app_module)
+
+    response, status_code = _extract_json_response(_run_management_quotes_job_status_route(app_module, "missing-job-id"))
+    assert status_code == 404
+    assert response.get("ok") is False
+    assert response.get("error_code") == "MANAGEMENT_QUOTES_JOB_NOT_FOUND"
 
 
 def test_coerce_int_range_bounds_and_types():

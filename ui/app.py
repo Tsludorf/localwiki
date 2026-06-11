@@ -16,8 +16,10 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import time
 import uuid
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, Thread
@@ -87,6 +89,26 @@ LOCALWIKI_ALLOWED_COMMANDS = {
     "troubleshoot": ["-m", "src.cli", "troubleshoot"],
 }
 LOCALWIKI_DEFAULT_SOURCES_PATH = str(Path("~/Desktop/wiki_sources").expanduser())
+MANAGEMENT_QUOTES_CLI = LOCALWIKI_ROOT / "management_quotes_combined.py"
+MANAGEMENT_QUOTES_COMMAND_TIMEOUT_SECONDS = 1200
+MANAGEMENT_QUOTES_STDOUT_MAX_BYTES = 8000
+MANAGEMENT_QUOTES_STDERR_MAX_BYTES = 8000
+MANAGEMENT_QUOTES_JOB_TTL_SECONDS = 60 * 60
+MANAGEMENT_QUOTES_DEFAULT_MODEL_OLLAMA = "qwen3.5:30b"
+MANAGEMENT_QUOTES_DEFAULT_MODEL_OPENROUTER = "anthropic/claude-sonnet-4.5"
+MANAGEMENT_QUOTES_DEFAULT_PROMPT_VERSION_OLLAMA = "management_quotes_v1_ollama"
+MANAGEMENT_QUOTES_DEFAULT_PROMPT_VERSION_CLOUD = "management_quotes_v1"
+MANAGEMENT_QUOTES_EXTRACT_DEFAULT_LIMIT = 50
+MANAGEMENT_QUOTES_EXTRACT_MAX_LIMIT = 500
+MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES = (os.environ.get("MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+MANAGEMENT_QUOTES_API_TOKEN = (os.environ.get("MANAGEMENT_QUOTES_API_TOKEN") or "").strip()
+MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = LOCALWIKI_ROOT / "config" / "integrations" / "management_quotes.json"
+MANAGEMENT_QUOTES_UPLOAD_DIR = LOCALWIKI_ROOT / "data" / "secrets" / "management_quotes"
+MANAGEMENT_QUOTES_UPLOAD_PATH = MANAGEMENT_QUOTES_UPLOAD_DIR / "app-config.json"
+MANAGEMENT_QUOTES_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = Path(os.environ.get("MANAGEMENT_QUOTES_FMP_CONFIG_PATH") or (LOCALWIKI_ROOT / "secrets" / "fmp" / "fmp_config.txt"))
+MANAGEMENT_QUOTES_JOB_LOCK = Lock()
+MANAGEMENT_QUOTES_JOBS: dict[str, dict[str, Any]] = {}
 SERVICE_RESTART_COMMANDS: dict[str, str] = {
     "AnythingLLM": "docker restart ai-anythingllm || docker restart anythingllm || docker restart anything-llm || docker restart anything_llm",
     "Ollama": "docker restart ai-ollama || docker restart ollama || (pkill -f '[o]llama serve' || true ; nohup ollama serve >/tmp/kilo/ollama.log 2>&1 </dev/null &)",
@@ -241,6 +263,35 @@ def _coerce_bool(value: Any, *, field: str, default: bool) -> tuple[bool, str | 
     if lowered in {"0", "false", "no", "n", "off"}:
         return False, None
     return default, f"{field} must be a boolean."
+
+
+def _coerce_float_range(value: Any, *, field: str, minimum: float, maximum: float | None, default: float) -> tuple[float, str | None]:
+    if value is None:
+        return default, None
+    try:
+        parsed = float(value)
+    except Exception:
+        return default, f"{field} must be a number."
+    if parsed < minimum:
+        return default, f"{field} must be at least {minimum}."
+    if maximum is not None and parsed > maximum:
+        return default, f"{field} must be at most {maximum}."
+    return parsed, None
+
+
+def _coerce_management_quotes_ticker_id(value: Any, *, field: str = "ticker_id") -> tuple[str | None, str | None]:
+    if value is None:
+        return None, f"{field} is required."
+
+    if isinstance(value, str):
+        normalized = value.strip()
+    else:
+        normalized = str(value).strip()
+
+    if not normalized:
+        return None, f"{field} is required."
+
+    return normalized, None
 
 
 def _merge_imager_config(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -2772,6 +2823,324 @@ def _run_localwiki_command(args: list[str]) -> dict[str, Any]:
         }
 
 
+def _read_file_tail(path: Path, max_bytes: int) -> str:
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return ""
+
+    with path.open("rb") as file_obj:
+        if size > max_bytes:
+            file_obj.seek(-max_bytes, os.SEEK_END)
+        data = file_obj.read(max_bytes)
+
+    return data.decode("utf-8", errors="replace")
+
+
+def _management_quotes_default_credentials_state() -> dict[str, Any]:
+    return {
+        "config_source": "not_set",
+        "config_path": None,
+        "uploaded_filename": None,
+    }
+
+
+def _load_management_quotes_credentials_state() -> dict[str, Any]:
+    if not MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH.exists():
+        return _management_quotes_default_credentials_state()
+    try:
+        loaded = json.loads(MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH.read_text(encoding="utf-8"))
+        merged = _management_quotes_default_credentials_state()
+        merged.update(loaded)
+        return merged
+    except Exception:
+        return _management_quotes_default_credentials_state()
+
+
+def _save_management_quotes_credentials_state(state: dict[str, Any]) -> None:
+    MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _extract_management_quotes_api_key_from_payload(payload: Any) -> str | None:
+    return _extract_management_quotes_config_values(payload, ("FMP_API_KEY", "FMP_API_TOKEN", "api_key", "token"))
+
+
+def _extract_management_quotes_config_values(payload: Any, keys: tuple[str, ...]) -> str | None:
+    if isinstance(payload, dict):
+        for key in keys:
+            candidate = payload.get(key)
+            if isinstance(candidate, str):
+                trimmed = candidate.strip()
+                if trimmed:
+                    return trimmed
+        nested = payload.get("configuration")
+        if isinstance(nested, dict):
+            for key in keys:
+                candidate = nested.get(key)
+                if isinstance(candidate, str):
+                    trimmed = candidate.strip()
+                    if trimmed:
+                        return trimmed
+
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return None
+
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                return _extract_management_quotes_config_values(json.loads(text), keys)
+            except Exception:
+                return None
+
+        for line in text.splitlines():
+            trimmed = line.strip()
+            if not trimmed or trimmed.startswith("#"):
+                continue
+            for key in keys:
+                if trimmed.startswith(f"{key}="):
+                    parts = trimmed.split("=", 1)
+                    if len(parts) == 2:
+                        return parts[1].strip().strip('"').strip("'")
+
+        return None
+
+    return None
+
+
+def _load_management_quotes_api_key_from_path(config_path: Any) -> str | None:
+    if not config_path:
+        return None
+
+    try:
+        text = Path(str(config_path)).read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return _extract_management_quotes_api_key_from_payload(text)
+
+    return _extract_management_quotes_api_key_from_payload(payload)
+
+
+def _load_management_quotes_config_value_from_path(config_path: Any, *, keys: tuple[str, ...]) -> str | None:
+    if not config_path:
+        return None
+
+    try:
+        text = Path(str(config_path)).read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return _extract_management_quotes_config_values(text, keys)
+
+    return _extract_management_quotes_config_values(payload, keys)
+
+
+def _resolve_management_quotes_api_key() -> str | None:
+    env_key = (os.environ.get("FMP_API_KEY") or os.environ.get("FMP_API_TOKEN") or "").strip()
+    if env_key:
+        return env_key
+
+    state = _load_management_quotes_credentials_state()
+    config_path = state.get("config_path")
+    state_key = _load_management_quotes_api_key_from_path(config_path)
+    if state_key:
+        return state_key
+
+    return _load_management_quotes_api_key_from_path(MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH)
+
+
+def _resolve_management_quotes_database_dsn() -> str | None:
+    env_dsn = (os.environ.get("NEON_CONNECTION_STRING") or os.environ.get("DATABASE_URL") or "").strip()
+    if env_dsn:
+        return env_dsn
+
+    state = _load_management_quotes_credentials_state()
+    config_path = state.get("config_path")
+    state_dsn = _load_management_quotes_config_value_from_path(
+        config_path,
+        keys=("NEON_CONNECTION_STRING", "DATABASE_URL"),
+    )
+    if state_dsn:
+        return state_dsn
+
+    return _load_management_quotes_config_value_from_path(
+        MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH,
+        keys=("NEON_CONNECTION_STRING", "DATABASE_URL"),
+    )
+
+
+def _run_management_quotes_command(args: list[str], timeout: int = MANAGEMENT_QUOTES_COMMAND_TIMEOUT_SECONDS) -> dict[str, Any]:
+    if not MANAGEMENT_QUOTES_CLI.exists():
+        return {
+            "ok": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": f"management_quotes_combined.py not found at {MANAGEMENT_QUOTES_CLI}",
+            "latency_ms": 0,
+            "ran_at": now_iso(),
+        }
+
+    env = os.environ.copy()
+    resolved_api_key = _resolve_management_quotes_api_key()
+    if resolved_api_key:
+        env["FMP_API_KEY"] = resolved_api_key
+    resolved_database_dsn = _resolve_management_quotes_database_dsn()
+    if resolved_database_dsn:
+        env["NEON_CONNECTION_STRING"] = resolved_database_dsn
+        env.setdefault("DATABASE_URL", resolved_database_dsn)
+
+    command_python = str(LOCALWIKI_VENV_PYTHON) if LOCALWIKI_VENV_PYTHON.exists() else str(sys.executable)
+    command = [command_python, str(MANAGEMENT_QUOTES_CLI)] + args
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="management-quotes-command-") as temp_dir:
+        stdout_path = Path(temp_dir) / "stdout.log"
+        stderr_path = Path(temp_dir) / "stderr.log"
+        try:
+            with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+                result = subprocess.run(
+                    command,
+                    cwd=str(LOCALWIKI_ROOT),
+                    text=False,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=timeout,
+                    env=env,
+                )
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            return {
+                "ok": result.returncode == 0,
+                "exit_code": result.returncode,
+                "stdout": _read_file_tail(stdout_path, MANAGEMENT_QUOTES_STDOUT_MAX_BYTES),
+                "stderr": _read_file_tail(stderr_path, MANAGEMENT_QUOTES_STDERR_MAX_BYTES),
+                "latency_ms": latency_ms,
+                "ran_at": now_iso(),
+            }
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            return {
+                "ok": False,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": repr(exc),
+                "latency_ms": latency_ms,
+                "ran_at": now_iso(),
+            }
+
+
+def _snapshot_management_quotes_job(job_id: str) -> dict[str, Any] | None:
+    with MANAGEMENT_QUOTES_JOB_LOCK:
+        job = MANAGEMENT_QUOTES_JOBS.get(job_id)
+        if not job:
+            return None
+        snapshot = dict(job)
+        if isinstance(job.get("result"), dict):
+            snapshot["result"] = dict(job["result"])
+    if isinstance(job.get("payload"), dict):
+        snapshot["payload"] = dict(job["payload"])
+    return snapshot
+
+
+def _build_queued_job_response(job_id: str) -> dict[str, Any] | None:
+    snapshot = _snapshot_management_quotes_job(job_id)
+    if snapshot is None:
+        return None
+    payload = dict(snapshot)
+    payload["status"] = "queued"
+    return payload
+
+
+def _prune_management_quotes_jobs() -> None:
+    cutoff = time.time() - MANAGEMENT_QUOTES_JOB_TTL_SECONDS
+    with MANAGEMENT_QUOTES_JOB_LOCK:
+        for job_id, job in list(MANAGEMENT_QUOTES_JOBS.items()):
+            finished_at = job.get("finished_at_ts")
+            if isinstance(finished_at, (int, float)) and finished_at < cutoff:
+                MANAGEMENT_QUOTES_JOBS.pop(job_id, None)
+                continue
+
+            created_at = job.get("created_at_ts")
+            updated_at = job.get("updated_at_ts", created_at)
+            if (
+                isinstance(created_at, (int, float))
+                and isinstance(updated_at, (int, float))
+                and created_at < cutoff
+                and updated_at < cutoff
+                and job.get("status") in {"queued", "running"}
+            ):
+                MANAGEMENT_QUOTES_JOBS.pop(job_id, None)
+
+
+def _enqueue_management_quotes_job(command: str, args: list[str], payload: dict[str, Any] | None = None) -> str:
+    _prune_management_quotes_jobs()
+
+    started_at = now_iso()
+    now_ts = time.time()
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "command": command,
+        "status": "queued",
+        "created_at": started_at,
+        "created_at_ts": now_ts,
+        "updated_at": started_at,
+        "updated_at_ts": now_ts,
+        "started_at": None,
+        "started_at_ts": None,
+        "finished_at": None,
+        "finished_at_ts": None,
+        "args": list(args),
+        "payload": payload or {},
+        "result": None,
+        "error": None,
+    }
+
+    with MANAGEMENT_QUOTES_JOB_LOCK:
+        MANAGEMENT_QUOTES_JOBS[job_id] = job
+
+    def run_job() -> None:
+        now_started = now_iso()
+        with MANAGEMENT_QUOTES_JOB_LOCK:
+            active_job = MANAGEMENT_QUOTES_JOBS.get(job_id)
+            if not active_job:
+                return
+            active_job["status"] = "running"
+            active_job["started_at"] = now_started
+            active_job["started_at_ts"] = time.time()
+            active_job["updated_at"] = now_started
+            active_job["updated_at_ts"] = time.time()
+
+        result = _run_management_quotes_command(args)
+
+        finished_at = now_iso()
+        finished_ts = time.time()
+        with MANAGEMENT_QUOTES_JOB_LOCK:
+            active_job = MANAGEMENT_QUOTES_JOBS.get(job_id)
+            if not active_job:
+                return
+            active_job["status"] = "completed" if result.get("ok") else "failed"
+            active_job["finished_at"] = finished_at
+            active_job["finished_at_ts"] = finished_ts
+            active_job["updated_at"] = finished_at
+            active_job["updated_at_ts"] = finished_ts
+            active_job["result"] = result
+            active_job["error"] = None if result.get("ok") else result.get("stderr")
+            if active_job["payload"]:
+                active_job["payload"] = dict(active_job["payload"])
+
+    thread = Thread(target=run_job, daemon=True)
+    thread.start()
+
+    return job_id
+
+
 def _source_loaded_summary(conn: sqlite3.Connection, source_id: str, root_uri: str) -> dict[str, Any]:
     cur = conn.cursor()
     cur.execute(
@@ -3072,6 +3441,362 @@ def api_localwiki_sources_update():
     result["path"] = expanded_path
     result["no_auto_ingest"] = no_auto_ingest
     return jsonify(result)
+
+
+def _build_management_quotes_validation_error(message: str, *, error_code: str, status_code: int = 400) -> tuple[dict[str, Any], int]:
+    return {"ok": False, "error": message, "error_code": error_code}, status_code
+
+
+def _require_management_quotes_api_token() -> tuple[dict[str, Any], int] | None:
+    if not MANAGEMENT_QUOTES_API_TOKEN:
+        return None
+
+    auth_header = ""
+    try:
+        auth_header = str(request.headers.get("Authorization", "")).strip()
+    except Exception:
+        auth_header = ""
+
+    request_token = request.headers.get("X-Management-Quotes-Token") if hasattr(request, "headers") else ""
+    request_token = str(request_token or "").strip()
+
+    token_value = ""
+    if auth_header.startswith("Bearer "):
+        token_value = auth_header[7:].strip()
+    elif auth_header:
+        token_value = auth_header
+
+    if not request_token:
+        request_token = token_value
+
+    if request_token == MANAGEMENT_QUOTES_API_TOKEN:
+        return None
+
+    return {"ok": False, "error": "Unauthorized", "error_code": "MANAGEMENT_QUOTES_UNAUTHORIZED"}, 401
+
+
+@app.route("/api/management-quotes/sync", methods=["POST"])
+def api_management_quotes_sync():
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    body = request.get_json(silent=True) or {}
+    ticker_id = body.get("ticker_id")
+    ticker_value, ticker_error = _coerce_management_quotes_ticker_id(ticker_id)
+    if ticker_error:
+        return _build_management_quotes_validation_error(ticker_error, error_code="MANAGEMENT_QUOTES_TICKER_ID_REQUIRED")
+
+    years, years_error = _coerce_int_range(body.get("years"), field="years", minimum=1, maximum=20, default=5)
+    if years_error:
+        return _build_management_quotes_validation_error(years_error, error_code="MANAGEMENT_QUOTES_YEARS_INVALID")
+
+    sleep_seconds, sleep_error = _coerce_float_range(
+        body.get("sleep_seconds"),
+        field="sleep_seconds",
+        minimum=0,
+        maximum=300,
+        default=0.5,
+    )
+    if sleep_error:
+        return _build_management_quotes_validation_error(sleep_error, error_code="MANAGEMENT_QUOTES_SLEEP_INVALID")
+
+    dry_run, dry_run_error = _coerce_bool(body.get("dry_run", False), field="dry_run", default=False)
+    if dry_run_error:
+        return _build_management_quotes_validation_error(dry_run_error, error_code="MANAGEMENT_QUOTES_DRY_RUN_INVALID")
+
+    args = ["sync", "--ticker-id", str(ticker_value), "--years", str(years), "--sleep", str(sleep_seconds)]
+    if dry_run:
+        args.append("--dry-run")
+
+    job_id = _enqueue_management_quotes_job("sync", args, payload=body)
+    snapshot = _build_queued_job_response(job_id)
+    if snapshot is None:
+        return jsonify({"ok": False, "error": "failed to create management quotes job"}), 500
+    return jsonify({"ok": True, "status": "queued", **snapshot}), 202
+
+
+@app.route("/api/management-quotes/extract", methods=["POST"])
+def api_management_quotes_extract():
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    body = request.get_json(silent=True) or {}
+    ticker_id = body.get("ticker_id")
+    ticker_value, ticker_error = _coerce_management_quotes_ticker_id(ticker_id)
+    if ticker_error:
+        return _build_management_quotes_validation_error(ticker_error, error_code="MANAGEMENT_QUOTES_TICKER_ID_REQUIRED")
+
+    provider = str(body.get("provider") or "ollama").strip().lower()
+    if provider not in {"ollama", "openrouter"}:
+        return _build_management_quotes_validation_error("provider must be either 'ollama' or 'openrouter'.", error_code="MANAGEMENT_QUOTES_PROVIDER_INVALID")
+
+    model = str(body.get("model") or "").strip()
+    model_arg = model or None
+
+    prompt_version = str(body.get("prompt_version") or "").strip()
+    prompt_version_arg = prompt_version or None
+
+    limit_value = body.get("limit")
+    if limit_value is None:
+        limit = MANAGEMENT_QUOTES_EXTRACT_DEFAULT_LIMIT
+    else:
+        try:
+            limit = int(limit_value)
+        except Exception:
+            return _build_management_quotes_validation_error("limit must be an integer.", error_code="MANAGEMENT_QUOTES_LIMIT_INVALID")
+        if limit <= 0:
+            return _build_management_quotes_validation_error("limit must be greater than 0.", error_code="MANAGEMENT_QUOTES_LIMIT_INVALID")
+        if limit > MANAGEMENT_QUOTES_EXTRACT_MAX_LIMIT:
+            return _build_management_quotes_validation_error(
+                f"limit must be at most {MANAGEMENT_QUOTES_EXTRACT_MAX_LIMIT}.",
+                error_code="MANAGEMENT_QUOTES_LIMIT_INVALID",
+            )
+
+    sleep_value = body.get("sleep")
+    if sleep_value is None:
+        sleep_seconds = 0.0
+    else:
+        sleep_seconds, sleep_error = _coerce_float_range(
+            sleep_value,
+            field="sleep",
+            minimum=0,
+            maximum=300,
+            default=0,
+        )
+        if sleep_error:
+            return _build_management_quotes_validation_error(sleep_error, error_code="MANAGEMENT_QUOTES_SLEEP_INVALID")
+
+    dry_run, dry_run_error = _coerce_bool(body.get("dry_run", False), field="dry_run", default=False)
+    if dry_run_error:
+        return _build_management_quotes_validation_error(dry_run_error, error_code="MANAGEMENT_QUOTES_DRY_RUN_INVALID")
+
+    create_table, create_table_error = _coerce_bool(body.get("create_table", False), field="create_table", default=False)
+    if create_table_error:
+        return _build_management_quotes_validation_error(create_table_error, error_code="MANAGEMENT_QUOTES_CREATE_TABLE_INVALID")
+
+    migrate, migrate_error = _coerce_bool(
+        body.get("migrate_dedupe_include_prompt_version", False),
+        field="migrate_dedupe_include_prompt_version",
+        default=False,
+    )
+    if migrate_error:
+        return _build_management_quotes_validation_error(
+            migrate_error,
+            error_code="MANAGEMENT_QUOTES_MIGRATE_DEDUPE_INCLUDE_PROMPT_VERSION_INVALID",
+        )
+
+    if (create_table or migrate) and not MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES:
+        return _build_management_quotes_validation_error(
+            "Schema mutation is disabled for this endpoint. Set MANAGEMENT_QUOTES_ALLOW_SCHEMA_CHANGES=true to enable.",
+            error_code="MANAGEMENT_QUOTES_SCHEMA_CHANGES_DISABLED",
+            status_code=403,
+        )
+
+    args = [
+        "extract",
+        "--ticker-id",
+        str(ticker_value),
+        "--provider",
+        provider,
+        "--sleep",
+        str(sleep_seconds),
+    ]
+
+    if model_arg:
+        args.extend(["--model", model_arg])
+
+    if prompt_version_arg:
+        args.extend(["--prompt-version", prompt_version_arg])
+    if limit is not None:
+        args.extend(["--limit", str(limit)])
+    if dry_run:
+        args.append("--dry-run")
+    if create_table:
+        args.append("--create-table")
+    if migrate:
+        args.append("--migrate-dedupe-include-prompt-version")
+
+    job_id = _enqueue_management_quotes_job("extract", args, payload=body)
+    snapshot = _build_queued_job_response(job_id)
+    if snapshot is None:
+        return jsonify({"ok": False, "error": "failed to create management quotes job"}), 500
+    return jsonify({"ok": True, "status": "queued", **snapshot}), 202
+
+
+@app.route("/api/management-quotes/compare", methods=["POST"])
+def api_management_quotes_compare():
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    body = request.get_json(silent=True) or {}
+    ticker_id = body.get("ticker_id")
+    ticker_value, ticker_error = _coerce_management_quotes_ticker_id(ticker_id)
+    if ticker_error:
+        return _build_management_quotes_validation_error(ticker_error, error_code="MANAGEMENT_QUOTES_TICKER_ID_REQUIRED")
+
+    raw_local_prompt_version = body.get("local_prompt_version")
+    raw_cloud_prompt_version = body.get("cloud_prompt_version")
+
+    if raw_local_prompt_version is None:
+        local_prompt_version = MANAGEMENT_QUOTES_DEFAULT_PROMPT_VERSION_OLLAMA
+    else:
+        local_prompt_version = str(raw_local_prompt_version).strip()
+
+    if raw_cloud_prompt_version is None:
+        cloud_prompt_version = MANAGEMENT_QUOTES_DEFAULT_PROMPT_VERSION_CLOUD
+    else:
+        cloud_prompt_version = str(raw_cloud_prompt_version).strip()
+
+    if not local_prompt_version:
+        return _build_management_quotes_validation_error("local_prompt_version is required.", error_code="MANAGEMENT_QUOTES_PROMPT_VERSION_REQUIRED")
+    if not cloud_prompt_version:
+        return _build_management_quotes_validation_error("cloud_prompt_version is required.", error_code="MANAGEMENT_QUOTES_PROMPT_VERSION_REQUIRED")
+
+    no_csv, no_csv_error = _coerce_bool(body.get("no_csv", False), field="no_csv", default=False)
+    if no_csv_error:
+        return _build_management_quotes_validation_error(no_csv_error, error_code="MANAGEMENT_QUOTES_NO_CSV_INVALID")
+
+    args = [
+        "compare",
+        "--ticker-id",
+        str(ticker_value),
+        "--local-prompt-version",
+        local_prompt_version,
+        "--cloud-prompt-version",
+        cloud_prompt_version,
+    ]
+    if no_csv:
+        args.append("--no-csv")
+
+    job_id = _enqueue_management_quotes_job("compare", args, payload=body)
+    snapshot = _build_queued_job_response(job_id)
+    if snapshot is None:
+        return jsonify({"ok": False, "error": "failed to create management quotes job"}), 500
+    return jsonify({"ok": True, "status": "queued", **snapshot}), 202
+
+
+@app.route("/api/management-quotes/jobs/<job_id>", methods=["GET"])
+def api_management_quotes_job_status(job_id: str):
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    snapshot = _snapshot_management_quotes_job(job_id)
+    if snapshot is None:
+        return jsonify({"ok": False, "error": f"Job not found: {job_id}", "error_code": "MANAGEMENT_QUOTES_JOB_NOT_FOUND"}), 404
+
+    payload = {
+        **snapshot,
+        "ok": snapshot.get("status") == "completed" and not snapshot.get("error"),
+    }
+    return jsonify(payload), 200
+
+
+@app.route("/api/management-quotes/config", methods=["POST"])
+def api_management_quotes_config():
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    body = request.get_json(silent=True) or {}
+    config_path_value = str(body.get("config_path") or "").strip()
+    if not config_path_value:
+        return jsonify({"ok": False, "configured": False, "message": "Config path is required."}), 400
+
+    path = Path(config_path_value).expanduser()
+    if not path.exists():
+        return jsonify({"ok": False, "configured": False, "message": "Config file not found."}), 400
+    if not path.is_file():
+        return jsonify({"ok": False, "configured": False, "message": "Config path is not a file."}), 400
+    if not os.access(path, os.R_OK):
+        return jsonify({"ok": False, "configured": False, "message": "Config file is unreadable."}), 400
+
+    try:
+        key = _load_management_quotes_api_key_from_path(path)
+        if not key:
+            return jsonify({"ok": False, "configured": False, "message": "No FMP API key found in file."}), 400
+    except Exception:
+        return jsonify({"ok": False, "configured": False, "message": "Invalid configuration file."}), 400
+
+    state = _load_management_quotes_credentials_state()
+    state["config_source"] = "path"
+    state["config_path"] = str(path)
+    state["uploaded_filename"] = None
+    _save_management_quotes_credentials_state(state)
+    return jsonify({
+        "ok": True,
+        "configured": True,
+        "message": "Management Quotes config path saved.",
+        "config_path_display": str(path),
+    })
+
+
+@app.route("/api/management-quotes/upload", methods=["POST"])
+def api_management_quotes_upload():
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    content_length = request.content_length or 0
+    if content_length > MANAGEMENT_QUOTES_UPLOAD_MAX_BYTES:
+        return jsonify({"ok": False, "message": "Upload too large."}), 413
+
+    body = request.get_json(silent=True) or {}
+    filename = str(body.get("filename") or "").strip()
+    content = str(body.get("content") or "")
+    if not filename:
+        return jsonify({"ok": False, "message": "Uploaded file name is required."}), 400
+    if not filename.lower().endswith(".json"):
+        return jsonify({"ok": False, "message": "Uploaded filename must end with .json."}), 400
+    if not content:
+        return jsonify({"ok": False, "message": "Uploaded file content is empty."}), 400
+
+    try:
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("invalid")
+    except Exception:
+        return jsonify({"ok": False, "message": "Invalid Management Quotes configuration."}), 400
+
+    key = _extract_management_quotes_api_key_from_payload(parsed)
+    if not key:
+        return jsonify({"ok": False, "message": "No FMP API key found in uploaded file."}), 400
+
+    MANAGEMENT_QUOTES_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MANAGEMENT_QUOTES_UPLOAD_DIR, stat.S_IRWXU)
+    MANAGEMENT_QUOTES_UPLOAD_PATH.write_text(content, encoding="utf-8")
+    os.chmod(MANAGEMENT_QUOTES_UPLOAD_PATH, stat.S_IRUSR | stat.S_IWUSR)
+
+    state = _load_management_quotes_credentials_state()
+    state["config_source"] = "uploaded_file"
+    state["config_path"] = str(MANAGEMENT_QUOTES_UPLOAD_PATH)
+    state["uploaded_filename"] = Path(filename).name
+    _save_management_quotes_credentials_state(state)
+
+    return jsonify({
+        "ok": True,
+        "configured": True,
+        "message": "Management Quotes config uploaded successfully.",
+        "config_path_display": str(MANAGEMENT_QUOTES_UPLOAD_PATH),
+        "uploaded_filename": Path(filename).name,
+    })
+
+
+@app.route("/api/management-quotes/clear", methods=["POST"])
+def api_management_quotes_clear():
+    unauthorized = _require_management_quotes_api_token()
+    if unauthorized is not None:
+        return jsonify(unauthorized[0]), unauthorized[1]
+
+    state = _load_management_quotes_credentials_state()
+    state["config_source"] = "not_set"
+    state["config_path"] = None
+    state["uploaded_filename"] = None
+    _save_management_quotes_credentials_state(state)
+    return jsonify({"ok": True, "configured": False, "message": "Management Quotes credentials cleared."})
 
 
 @app.route("/api/anythingllm/query", methods=["POST"])

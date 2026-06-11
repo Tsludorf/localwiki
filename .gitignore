@@ -19,3 +19,4 @@ localwiki_registry.db
 /vendor/factset/
 secrets/factset/LocalWiki JWT-config.json
 secrets/factset/
+secrets/fmp/fmp_config.txt
