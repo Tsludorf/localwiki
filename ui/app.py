@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import traceback
 import tempfile
 import time
 import uuid
@@ -24,10 +25,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
-from urllib.parse import urlparse
+
 
 import requests
 from flask import Flask, jsonify, render_template, request
+
+from management_quotes_dsn_utils import is_management_quotes_placeholder_dsn
 
 app = Flask(__name__)
 
@@ -2993,6 +2996,26 @@ def _run_management_quotes_command(args: list[str], timeout: int = MANAGEMENT_QU
     if resolved_api_key:
         env["FMP_API_KEY"] = resolved_api_key
     resolved_database_dsn = _resolve_management_quotes_database_dsn()
+    if is_management_quotes_placeholder_dsn(resolved_database_dsn):
+        return {
+            "ok": False,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "management_quotes_combined.py received an invalid database DSN: placeholder host 'host'.\n\n"
+            + json.dumps(
+                {
+                    "command": [str(LOCALWIKI_VENV_PYTHON), str(MANAGEMENT_QUOTES_CLI)] + args,
+                    "command_args": args,
+                    "resolved_database_dsn": "<redacted>",
+                    "error": "Refusing unresolved DB host 'host'",
+                    "error_type": "ValueError",
+                    "working_dir": str(LOCALWIKI_ROOT),
+                },
+                indent=2,
+            ),
+            "latency_ms": 0,
+            "ran_at": now_iso(),
+        }
     if resolved_database_dsn:
         env["NEON_CONNECTION_STRING"] = resolved_database_dsn
         env.setdefault("DATABASE_URL", resolved_database_dsn)
@@ -3000,6 +3023,15 @@ def _run_management_quotes_command(args: list[str], timeout: int = MANAGEMENT_QU
     command_python = str(LOCALWIKI_VENV_PYTHON) if LOCALWIKI_VENV_PYTHON.exists() else str(sys.executable)
     command = [command_python, str(MANAGEMENT_QUOTES_CLI)] + args
     started = time.perf_counter()
+    working_dir = str(LOCALWIKI_ROOT)
+    debug_env_snapshot = {
+        "NEON_CONNECTION_STRING": bool(env.get("NEON_CONNECTION_STRING")),
+        "DATABASE_URL": bool(env.get("DATABASE_URL")),
+        "FMP_API_KEY": bool(env.get("FMP_API_KEY")),
+        "OPENROUTER_API_KEY": bool(env.get("OPENROUTER_API_KEY")),
+        "MANAGEMENT_QUOTES_LOG_VERBOSITY": bool(env.get("MANAGEMENT_QUOTES_LOG_VERBOSITY")),
+    }
+
     with tempfile.TemporaryDirectory(prefix="management-quotes-command-") as temp_dir:
         stdout_path = Path(temp_dir) / "stdout.log"
         stderr_path = Path(temp_dir) / "stderr.log"
@@ -3007,7 +3039,7 @@ def _run_management_quotes_command(args: list[str], timeout: int = MANAGEMENT_QU
             with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
                 result = subprocess.run(
                     command,
-                    cwd=str(LOCALWIKI_ROOT),
+                    cwd=working_dir,
                     text=False,
                     stdout=stdout_file,
                     stderr=stderr_file,
@@ -3015,11 +3047,42 @@ def _run_management_quotes_command(args: list[str], timeout: int = MANAGEMENT_QU
                     env=env,
                 )
             latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            stdout = _read_file_tail(stdout_path, MANAGEMENT_QUOTES_STDOUT_MAX_BYTES)
+            stderr = _read_file_tail(stderr_path, MANAGEMENT_QUOTES_STDERR_MAX_BYTES)
+            if result.returncode != 0:
+                diagnostic = {
+                    "command": command,
+                    "return_code": result.returncode,
+                    "working_dir": working_dir,
+                    "env": debug_env_snapshot,
+                }
+                serialized = json.dumps(diagnostic, indent=2, default=str)
+                stderr = f"{stderr}\n\n[management-quotes] execution failure:\n{serialized}" if stderr else f"[management-quotes] execution failure:\n{serialized}"
+
             return {
                 "ok": result.returncode == 0,
                 "exit_code": result.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "latency_ms": latency_ms,
+                "ran_at": now_iso(),
+            }
+        except subprocess.TimeoutExpired:
+            latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            return {
+                "ok": False,
+                "exit_code": None,
                 "stdout": _read_file_tail(stdout_path, MANAGEMENT_QUOTES_STDOUT_MAX_BYTES),
-                "stderr": _read_file_tail(stderr_path, MANAGEMENT_QUOTES_STDERR_MAX_BYTES),
+                "stderr": "Management Quotes command timed out.\n\n" + json.dumps(
+                    {
+                        "command": command,
+                        "timeout_seconds": timeout,
+                        "working_dir": working_dir,
+                        "env": debug_env_snapshot,
+                    },
+                    indent=2,
+                    default=str,
+                ),
                 "latency_ms": latency_ms,
                 "ran_at": now_iso(),
             }
@@ -3029,7 +3092,18 @@ def _run_management_quotes_command(args: list[str], timeout: int = MANAGEMENT_QU
                 "ok": False,
                 "exit_code": None,
                 "stdout": "",
-                "stderr": repr(exc),
+                "stderr": json.dumps(
+                    {
+                        "command": command,
+                        "error": repr(exc),
+                        "error_type": type(exc).__name__,
+                        "working_dir": working_dir,
+                        "env": debug_env_snapshot,
+                        "traceback": traceback.format_exc(),
+                    },
+                    indent=2,
+                    default=str,
+                ),
                 "latency_ms": latency_ms,
                 "ran_at": now_iso(),
             }
@@ -3117,7 +3191,26 @@ def _enqueue_management_quotes_job(command: str, args: list[str], payload: dict[
             active_job["updated_at"] = now_started
             active_job["updated_at_ts"] = time.time()
 
-        result = _run_management_quotes_command(args)
+        try:
+            result = _run_management_quotes_command(args)
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "ok": False,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": json.dumps(
+                    {
+                        "command": args,
+                        "error": repr(exc),
+                        "error_type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
+                    },
+                    indent=2,
+                    default=str,
+                ),
+                "latency_ms": None,
+                "ran_at": now_iso(),
+            }
 
         finished_at = now_iso()
         finished_ts = time.time()

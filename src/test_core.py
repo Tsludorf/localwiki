@@ -18,6 +18,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(SRC_ROOT))
 
+from management_quotes_dsn_utils import is_management_quotes_placeholder_dsn
 from core import (
     IngestionRegistry,
     Source,
@@ -1271,6 +1272,106 @@ def test_run_management_quotes_command_includes_management_dsn_and_api_key_env()
             os.environ.pop("FMP_API_KEY", None)
         else:
             os.environ["FMP_API_KEY"] = original_fmp_key
+
+
+def test_run_management_quotes_command_surfaces_traceback_on_exception():
+    app_module = _load_imager_app_module_for_tests()
+
+    calls = {}
+
+    def fake_run(command, **kwargs):
+        calls["command"] = list(command)
+        raise OSError("boom")
+
+    original_run = app_module.subprocess.run
+    try:
+        app_module.subprocess.run = fake_run
+        result = app_module._run_management_quotes_command(["sync", "--ticker-id", "1234"])
+
+        assert result.get("ok") is False
+        assert calls.get("command") == [str(app_module.LOCALWIKI_VENV_PYTHON), str(app_module.MANAGEMENT_QUOTES_CLI), "sync", "--ticker-id", "1234"]
+        stderr_text = result.get("stderr", "")
+        assert "OSError" in stderr_text
+        assert "traceback" in stderr_text
+        assert "error_type" in stderr_text
+    finally:
+        app_module.subprocess.run = original_run
+
+
+def test_run_management_quotes_command_surfaces_timeout_context():
+    app_module = _load_imager_app_module_for_tests()
+
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=7)
+
+    original_run = app_module.subprocess.run
+    try:
+        app_module.subprocess.run = fake_run
+        result = app_module._run_management_quotes_command(["extract", "--ticker-id", "1234"], timeout=7)
+
+        assert result.get("ok") is False
+        stderr_text = result.get("stderr", "")
+        assert "Management Quotes command timed out." in stderr_text
+        assert "\"timeout_seconds\": 7" in stderr_text
+    finally:
+        app_module.subprocess.run = original_run
+
+
+def test_run_management_quotes_command_rejects_placeholder_database_host():
+    app_module = _load_imager_app_module_for_tests()
+
+    with tempfile.TemporaryDirectory(prefix="mq-placeholder-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        fallback = tmp_root / "fmp_config.txt"
+        fallback.write_text("NEON_CONNECTION_STRING=postgresql://user:password@host/database\n", encoding="utf-8")
+
+        original_fallback = app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH
+        original_state = app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH
+        original_neon = os.environ.get("NEON_CONNECTION_STRING")
+        original_database_url = os.environ.get("DATABASE_URL")
+
+        app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = fallback
+        app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = tmp_root / "state.json"
+        os.environ.pop("NEON_CONNECTION_STRING", None)
+        os.environ.pop("DATABASE_URL", None)
+
+        calls = {"run_called": False}
+        original_run = app_module.subprocess.run
+
+        def fake_run(*_args, **_kwargs):
+            calls["run_called"] = True
+
+        app_module.subprocess.run = fake_run
+
+        try:
+            result = app_module._run_management_quotes_command(["sync", "--ticker-id", "1234"])
+
+            assert result.get("ok") is False
+            assert result.get("exit_code") is None
+            assert calls["run_called"] is False
+            stderr_text = result.get("stderr", "")
+            assert "placeholder host 'host'" in stderr_text
+            assert "Refusing unresolved DB host 'host'" in stderr_text
+        finally:
+            app_module.subprocess.run = original_run
+            app_module.MANAGEMENT_QUOTES_FALLBACK_CONFIG_PATH = original_fallback
+            app_module.MANAGEMENT_QUOTES_CREDENTIALS_STATE_PATH = original_state
+            if original_neon is None:
+                os.environ.pop("NEON_CONNECTION_STRING", None)
+            else:
+                os.environ["NEON_CONNECTION_STRING"] = original_neon
+            if original_database_url is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = original_database_url
+
+
+def test_is_management_quotes_placeholder_dsn_detection():
+    assert is_management_quotes_placeholder_dsn("postgresql://user:password@host/database")
+    assert is_management_quotes_placeholder_dsn("postgresql+psycopg://u:p@HOST/db")
+    assert not is_management_quotes_placeholder_dsn("postgresql://user:password@db.internal/database")
+    assert not is_management_quotes_placeholder_dsn("sqlite:///tmp/data.db")
+    assert not is_management_quotes_placeholder_dsn(None)
 
 
 def test_api_management_quotes_compare_rejects_missing_prompt_version():

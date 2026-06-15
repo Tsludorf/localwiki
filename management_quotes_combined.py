@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import traceback
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from management_quotes_dsn_utils import is_management_quotes_placeholder_dsn
 
 try:
     import psycopg
@@ -142,6 +144,8 @@ def load_database_dsn_from_env() -> str:
     dsn = os.getenv("NEON_CONNECTION_STRING") or os.getenv("DATABASE_URL")
     if not dsn:
         raise RuntimeError("Set NEON_CONNECTION_STRING or DATABASE_URL in .env")
+    if is_management_quotes_placeholder_dsn(dsn):
+        raise RuntimeError("Refusing unresolved DB host 'host' in connection string")
     return dsn
 
 
@@ -1098,88 +1102,140 @@ def compare_prompt_versions(conn: psycopg.Connection, ticker_id: int, *, local_p
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
+    try:
+        parser = argparse.ArgumentParser(description=__doc__)
+        sub = parser.add_subparsers(dest="command", required=True)
 
-    p_sync = sub.add_parser("sync", help="Fetch FMP transcripts into fmp_transcript")
-    p_sync.add_argument("--ticker-id", required=True)
-    p_sync.add_argument("--years", type=int, default=5)
-    p_sync.add_argument("--dry-run", action="store_true")
-    p_sync.add_argument("--sleep", type=float, default=0.5)
+        p_sync = sub.add_parser("sync", help="Fetch FMP transcripts into fmp_transcript")
+        p_sync.add_argument("--ticker-id", required=True)
+        p_sync.add_argument("--years", type=int, default=5)
+        p_sync.add_argument("--dry-run", action="store_true")
+        p_sync.add_argument("--sleep", type=float, default=0.5)
 
-    p_extract = sub.add_parser("extract", help="Extract management quotes")
-    p_extract.add_argument("--ticker-id", required=True)
-    p_extract.add_argument("--provider", choices=["openrouter", "ollama"], default="ollama")
-    p_extract.add_argument("--model", default=None)
-    p_extract.add_argument("--prompt-version", default=None)
-    p_extract.add_argument("--limit", type=int, default=None)
-    p_extract.add_argument("--sleep", type=float, default=0.0)
-    p_extract.add_argument("--create-table", action="store_true")
-    p_extract.add_argument("--migrate-dedupe-include-prompt-version", action="store_true")
-    p_extract.add_argument("--dry-run", action="store_true")
+        p_extract = sub.add_parser("extract", help="Extract management quotes")
+        p_extract.add_argument("--ticker-id", required=True)
+        p_extract.add_argument("--provider", choices=["openrouter", "ollama"], default="ollama")
+        p_extract.add_argument("--model", default=None)
+        p_extract.add_argument("--prompt-version", default=None)
+        p_extract.add_argument("--limit", type=int, default=None)
+        p_extract.add_argument("--sleep", type=float, default=0.0)
+        p_extract.add_argument("--create-table", action="store_true")
+        p_extract.add_argument("--migrate-dedupe-include-prompt-version", action="store_true")
+        p_extract.add_argument("--dry-run", action="store_true")
 
-    p_compare = sub.add_parser("compare", help="Compare local/cloud prompt versions")
-    p_compare.add_argument("--ticker-id", required=True)
-    p_compare.add_argument("--local-prompt-version", default=PROMPT_VERSION_OLLAMA)
-    p_compare.add_argument("--cloud-prompt-version", default=PROMPT_VERSION_CLOUD)
-    p_compare.add_argument("--no-csv", action="store_true")
+        p_compare = sub.add_parser("compare", help="Compare local/cloud prompt versions")
+        p_compare.add_argument("--ticker-id", required=True)
+        p_compare.add_argument("--local-prompt-version", default=PROMPT_VERSION_OLLAMA)
+        p_compare.add_argument("--cloud-prompt-version", default=PROMPT_VERSION_CLOUD)
+        p_compare.add_argument("--no-csv", action="store_true")
 
-    args = parser.parse_args(argv)
-    dsn = load_database_dsn_from_env()
-    with psycopg.connect(dsn) as conn:
-        try:
-            resolved_ticker_id = resolve_ticker_id(conn, str(args.ticker_id))
-        except ValueError as exc:
-            print(f"{exc}", file=sys.stderr)
-            return 2
+        args = parser.parse_args(argv)
+        dsn = load_database_dsn_from_env()
 
-        if args.command == "sync":
-            counts = backfill_company(conn, resolved_ticker_id, years=args.years, dry_run=args.dry_run, sleep_s=args.sleep)
-            print(json.dumps(counts.__dict__, indent=2, default=str))
-            return 0
+        with psycopg.connect(dsn) as conn:
+            try:
+                resolved_ticker_id = resolve_ticker_id(conn, str(args.ticker_id))
+            except ValueError as exc:
+                print(
+                    json.dumps(
+                        {
+                            "command": args.command,
+                            "error": str(exc),
+                            "error_type": type(exc).__name__,
+                            "ticker_id": args.ticker_id,
+                            "traceback": traceback.format_exc(),
+                        },
+                        indent=2,
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
 
-        if args.command == "extract":
-            if args.create_table:
-                ensure_table(conn)
-            if args.migrate_dedupe_include_prompt_version:
-                migrate_dedupe_include_prompt_version(conn)
-            provider = args.provider
-            model = args.model or (DEFAULT_OLLAMA_MODEL if provider == "ollama" else DEFAULT_OPENROUTER_MODEL)
-            prompt_version = args.prompt_version or (PROMPT_VERSION_OLLAMA if provider == "ollama" else PROMPT_VERSION_CLOUD)
-            if args.dry_run:
-                rows = fetch_transcripts_for_ticker(conn, resolved_ticker_id, prompt_version=prompt_version, limit=args.limit)
-                print(json.dumps({
-                    "ticker_id": resolved_ticker_id, "provider": provider, "model": model,
-                    "prompt_version": prompt_version, "transcripts_to_process": len(rows), "dry_run": True,
-                }, indent=2))
+            if args.command == "sync":
+                counts = backfill_company(
+                    conn,
+                    resolved_ticker_id,
+                    years=args.years,
+                    dry_run=args.dry_run,
+                    sleep_s=args.sleep,
+                )
+                print(json.dumps(counts.__dict__, indent=2, default=str))
                 return 0
-            counts = run_extraction(
-                conn,
-                resolved_ticker_id,
-                provider=provider,
-                model=model,
-                prompt_version=prompt_version,
-                limit=args.limit,
-                sleep_s=args.sleep,
-            )
-            print(json.dumps({
-                "ticker_id": resolved_ticker_id, "provider": provider, "model": model,
-                "prompt_version": prompt_version, **counts.__dict__,
-            }, indent=2, default=str))
-            return 0
 
-        if args.command == "compare":
-            report = compare_prompt_versions(
-                conn,
-                resolved_ticker_id,
-                local_prompt_version=args.local_prompt_version,
-                cloud_prompt_version=args.cloud_prompt_version,
-                write_csv=not args.no_csv,
-            )
-            print(json.dumps(report, indent=2, default=str))
-            return 0
+            if args.command == "extract":
+                if args.create_table:
+                    ensure_table(conn)
+                if args.migrate_dedupe_include_prompt_version:
+                    migrate_dedupe_include_prompt_version(conn)
+                provider = args.provider
+                model = args.model or (DEFAULT_OLLAMA_MODEL if provider == "ollama" else DEFAULT_OPENROUTER_MODEL)
+                prompt_version = args.prompt_version or (PROMPT_VERSION_OLLAMA if provider == "ollama" else PROMPT_VERSION_CLOUD)
+                if args.dry_run:
+                    rows = fetch_transcripts_for_ticker(conn, resolved_ticker_id, prompt_version=prompt_version, limit=args.limit)
+                    print(
+                        json.dumps(
+                            {
+                                "ticker_id": resolved_ticker_id,
+                                "provider": provider,
+                                "model": model,
+                                "prompt_version": prompt_version,
+                                "transcripts_to_process": len(rows),
+                                "dry_run": True,
+                            },
+                            indent=2,
+                        )
+                    )
+                    return 0
+                counts = run_extraction(
+                    conn,
+                    resolved_ticker_id,
+                    provider=provider,
+                    model=model,
+                    prompt_version=prompt_version,
+                    limit=args.limit,
+                    sleep_s=args.sleep,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "ticker_id": resolved_ticker_id,
+                            "provider": provider,
+                            "model": model,
+                            "prompt_version": prompt_version,
+                            **counts.__dict__,
+                        },
+                        indent=2,
+                        default=str,
+                    )
+                )
+                return 0
 
-    return 0
+            if args.command == "compare":
+                report = compare_prompt_versions(
+                    conn,
+                    resolved_ticker_id,
+                    local_prompt_version=args.local_prompt_version,
+                    cloud_prompt_version=args.cloud_prompt_version,
+                    write_csv=not args.no_csv,
+                )
+                print(json.dumps(report, indent=2, default=str))
+                return 0
+
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(
+            json.dumps(
+                {
+                    "command": list(argv) if argv is not None else sys.argv[1:],
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "traceback": traceback.format_exc(),
+                },
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":

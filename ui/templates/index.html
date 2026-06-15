@@ -18,6 +18,12 @@
       <button id="restartUiBtn" class="secondary">Restart UI service</button>
     </header>
 
+    <section id="apiConnection" class="overall loading">
+      <h2 id="apiConnectionTitle">API Connection: Checking...</h2>
+      <p id="apiConnectionMeta">Checking dashboard API availability...</p>
+      <div id="apiConnectionStats" class="quick-stats"></div>
+    </section>
+
     <section id="overall" class="overall loading">
       <h2>Overall status: Checking...</h2>
       <p id="meta">Loading latest data...</p>
@@ -254,6 +260,10 @@ const rawEl = document.getElementById('raw');
 const refreshBtn = document.getElementById('refreshBtn');
 const restartAllBtn = document.getElementById('restartAllBtn');
 const restartUiBtn = document.getElementById('restartUiBtn');
+const apiConnectionEl = document.getElementById('apiConnection');
+const apiConnectionTitleEl = document.getElementById('apiConnectionTitle');
+const apiConnectionMetaEl = document.getElementById('apiConnectionMeta');
+const apiConnectionStatsEl = document.getElementById('apiConnectionStats');
 const overallEl = document.getElementById('overall');
 const quickStatsEl = document.getElementById('quickStats');
 const venvStartBtn = document.getElementById('venvStartBtn');
@@ -402,6 +412,33 @@ function getInitialTabFromUrl() {
 function setTabStatus(el, healthy) {
   el.classList.toggle('tab-dot-good', healthy);
   el.classList.toggle('tab-dot-bad', !healthy);
+}
+
+function setApiConnectionStatus(connected, details = null) {
+  if (connected) {
+    apiConnectionEl.className = 'overall good';
+    const { statusCode, latencyMs, generatedAt } = details || {};
+    const statusText = statusCode ? `HTTP ${statusCode}` : 'HTTP n/a';
+    const pingText = Number.isFinite(latencyMs) ? `${latencyMs}ms` : 'n/a';
+    const timeText = formatDateEST(generatedAt || Date.now());
+    apiConnectionTitleEl.textContent = 'API Connection: Connected';
+    apiConnectionMetaEl.textContent = `Status ${statusText} • Response time ${pingText} • Last data ${timeText}`;
+    apiConnectionStatsEl.innerHTML = `
+      <div class="stat good"><strong>Connected</strong><span>${statusText}</span></div>
+      <div class="stat"><strong>${pingText}</strong><span>Latency</span></div>
+      <div class="stat"><strong>OK</strong><span>Endpoint</span></div>
+    `;
+    return;
+  }
+
+  apiConnectionEl.className = 'overall bad';
+  apiConnectionTitleEl.textContent = 'API Connection: Failed';
+  apiConnectionMetaEl.textContent = `Unable to reach /api/status${details && details.message ? ` (${details.message})` : ''}`;
+  apiConnectionStatsEl.innerHTML = `
+    <div class="stat bad"><strong>0</strong><span>Connected</span></div>
+    <div class="stat bad"><strong>—</strong><span>Latency</span></div>
+    <div class="stat bad"><strong>OFFLINE</strong><span>Endpoint</span></div>
+  `;
 }
 
 function renderOverall(services, generatedAt) {
@@ -1236,8 +1273,21 @@ async function restartService(serviceName) {
 
 async function refresh() {
   try {
+    const apiCheckStarted = performance.now();
     const res = await fetch('/api/status', { cache: 'no-store' });
+    const apiLatency = Math.round(performance.now() - apiCheckStarted);
+
+    if (!res.ok) {
+      setApiConnectionStatus(false, { message: `${res.status} ${res.statusText}` });
+      overallEl.className = 'overall bad';
+      overallEl.querySelector('h2').textContent = 'Overall status: API reported an error';
+      metaEl.textContent = `Error while loading dashboard: ${res.status} ${res.statusText}`;
+      setTabStatus(servicesTabStatusEl, false);
+      return;
+    }
+
     const data = await res.json();
+    setApiConnectionStatus(true, { statusCode: res.status, latencyMs: apiLatency, generatedAt: data.generated_at });
 
     const services = data.services || [];
     renderOverall(services, data.generated_at);
@@ -1250,6 +1300,7 @@ async function refresh() {
       await refreshFactsetSdkCatalog();
     }
   } catch (err) {
+    setApiConnectionStatus(false, { message: String(err) });
     overallEl.className = 'overall bad';
     overallEl.querySelector('h2').textContent = 'Overall status: Unable to fetch data';
     metaEl.textContent = `Error while loading dashboard: ${err}`;
